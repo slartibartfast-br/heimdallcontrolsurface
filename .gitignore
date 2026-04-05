@@ -31,3 +31,12 @@ data/logs/
 # Environment
 .env
 .env.local
+
+# Swift
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+xcuserdata/
