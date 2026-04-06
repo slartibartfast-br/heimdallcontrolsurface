@@ -1,25 +1,39 @@
-# PLAN: HCS-001 SPM Project Scaffold
+# PLAN: HCS-004 — WebSocket Service
 
 ## Preflight Checklist
 
-### 1. git status
+### git status
 ```
-On branch feat/AASF-645
-nothing to commit, working tree clean
+On branch feat/AASF-648
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	Sources/HEIMDALLControlSurface/Models/Agent.swift
+	Sources/HEIMDALLControlSurface/Models/Infrastructure.swift
+	Sources/HEIMDALLControlSurface/Models/KPI.swift
+	Sources/HEIMDALLControlSurface/Models/Pipeline.swift
+	Sources/HEIMDALLControlSurface/Models/Project.swift
+	Sources/HEIMDALLControlSurface/Models/Verdict.swift
+	Sources/HEIMDALLControlSurface/Services/HeimdallAPIClient.swift
+	Sources/HEIMDALLControlSurface/Services/JSONDecoding.swift
+	Sources/HEIMDALLControlSurface/Services/MockAPIClient.swift
+
+nothing added to commit but untracked files present (use "git add" to track)
 ```
 
-### 2. git branch
+### git branch
 ```
-* feat/AASF-645
++ feat/AASF-646
+* feat/AASF-648
 + main
 ```
 
-### 3. ls data/queue/
+### ls data/queue/
 ```
-ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-645/data/queue/: No such file or directory
+ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-648/data/queue/: No such file or directory
 ```
+(No queue directory exists — this is a Swift project, no stale envelopes)
 
-### 4. Mandatory Rules from CLAUDE.md
+### Mandatory Rules from CLAUDE.md
 1. Functions < 50 lines
 2. Read signatures before calling
 3. String matching: \b word boundaries only
@@ -33,373 +47,487 @@ ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-645/data/queue/: No
 
 ## Scope
 
-Create the Swift Package Manager project structure for HEIMDALL Control Surface (HCS), a macOS monitoring and control dashboard application using SwiftUI, SwiftData, and Swift Charts.
-
-**What this plan covers:**
-- Package.swift manifest with all dependencies
-- Sources/ directory with organized module structure
-- Tests/ directory with test target stubs
-- Resources/ directory with asset catalog
-- Swift-specific .gitignore additions
-- README.md with build instructions
-
-**What this plan does NOT cover:**
-- Actual application logic implementation
-- UI design beyond placeholder files
-- Data model implementation details
+| Action | File | Purpose |
+|--------|------|---------|
+| CREATE | `Sources/.../Models/Event.swift` | WebSocket event models (factory_update, verdict, heartbeat) |
+| CREATE | `Sources/.../Services/WebSocketService.swift` | URLSession WebSocket connection with exponential backoff |
+| CREATE | `Sources/.../Services/SSEService.swift` | Server-Sent Events fallback service |
+| CREATE | `Sources/.../Services/ConnectionManager.swift` | Orchestrates WebSocket → SSE → REST fallback |
+| CREATE | `Sources/.../State/AppState.swift` | Observable state container for live updates |
+| MODIFY | `Tests/.../ServiceTests.swift` | Add WebSocket, SSE, ConnectionManager tests |
 
 ---
 
-## Analysis
+## Design
 
-### Current State
-- Worktree contains only Heimdall configuration files (.agent/, docs/, CLAUDE.md, GEMINI.md)
-- No Swift files exist - greenfield project
-- Swift 6.3 is available on host system
-- Existing .gitignore covers Python but not Swift
+### Architecture Overview
 
-### Target State
-Standard SPM executable package structure with:
-- Single executable target: `HEIMDALLControlSurface`
-- Test target: `HEIMDALLControlSurfaceTests`
-- Organized source subdirectories for Models, Views, Services
+```
+┌─────────────────────────────────────────────────────────┐
+│                      AppState                            │
+│   @Published pipelines, verdicts, connectionStatus       │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│                  ConnectionManager                       │
+│   Orchestrates: WebSocket → SSE → REST polling          │
+│   Tracks: ConnectionStatus, retry logic                 │
+└───────┬──────────────────┬──────────────────┬───────────┘
+        │                  │                  │
+        ▼                  ▼                  ▼
+┌───────────────┐  ┌───────────────┐  ┌────────────────────┐
+│WebSocketService│ │  SSEService   │  │ HeimdallAPIClient  │
+│ws://host/ws/  │  │ /api/events   │  │  REST polling      │
+│   events      │  │   (SSE)       │  │  (existing)        │
+└───────────────┘  └───────────────┘  └────────────────────┘
+```
+
+### 1. Event Models (`Event.swift`)
+
+**Purpose:** Strongly-typed models for real-time WebSocket events.
+
+```swift
+// Event types matching HEIMDALL monitor backend
+public enum EventType: String, Codable, Sendable {
+    case factoryUpdate = "factory_update"
+    case verdict = "verdict"
+    case heartbeat = "heartbeat"
+    case pipelineUpdate = "pipeline_update"
+    case agentStatus = "agent_status"
+}
+
+// Wrapper for all events
+public struct WebSocketEvent: Codable, Sendable, Identifiable {
+    public let id: UUID
+    public let type: EventType
+    public let timestamp: Date
+    public let payload: Data  // Raw JSON for type-specific decoding
+}
+
+// Type-specific payloads
+public struct FactoryUpdatePayload: Codable, Sendable {
+    public let factoryStatus: FactoryStatus
+    public let pipelines: [PipelineEntry]
+}
+
+public struct VerdictPayload: Codable, Sendable {
+    public let verdict: VerdictEntry
+}
+
+public struct HeartbeatPayload: Codable, Sendable {
+    public let agents: [AgentHeartbeat]
+    public let uptimeSeconds: Int
+}
+```
+
+**Line estimate:** ~85 lines (models only, no logic)
+
+### 2. WebSocketService (`WebSocketService.swift`)
+
+**Purpose:** Manages URLSession WebSocket connection with reconnection logic.
+
+**Key Components:**
+
+```swift
+/// Connection state for WebSocket
+public enum WebSocketState: Sendable, Equatable {
+    case disconnected
+    case connecting
+    case connected
+    case reconnecting(attempt: Int)
+}
+
+/// Protocol for WebSocket service (enables mocking)
+public protocol WebSocketServiceProtocol: Sendable {
+    func connect() async throws
+    func disconnect() async
+    var events: AsyncStream<WebSocketEvent> { get }
+    var state: WebSocketState { get async }
+}
+
+/// URLSession-based WebSocket service with exponential backoff
+public actor WebSocketService: WebSocketServiceProtocol {
+    private let url: URL
+    private let session: URLSession
+    private var webSocketTask: URLSessionWebSocketTask?
+    private var reconnectAttempt: Int = 0
+    private let maxReconnectDelay: TimeInterval = 30.0
+    private let baseDelay: TimeInterval = 1.0
+
+    // Exponential backoff: 1s → 2s → 4s → 8s → 16s → 30s (capped)
+    private func reconnectDelay() -> TimeInterval
+
+    public func connect() async throws
+    public func disconnect() async
+    private func receiveMessages() async
+    private func scheduleReconnect() async
+}
+```
+
+**Guard/Recovery Pairs:**
+| Guard | Recovery |
+|-------|----------|
+| Connection fails | Schedule reconnect with exponential backoff |
+| Message decode error | Log warning, continue receiving |
+| Task cancelled | Clean disconnect, no reconnect |
+| Max retries reached | Notify delegate/callback of failure |
+
+**Line estimates per function:**
+- `reconnectDelay()`: 8 lines
+- `connect()`: 22 lines
+- `disconnect()`: 12 lines
+- `receiveMessages()`: 28 lines
+- `scheduleReconnect()`: 18 lines
+
+### 3. SSEService (`SSEService.swift`)
+
+**Purpose:** Server-Sent Events fallback when WebSocket unavailable.
+
+```swift
+/// SSE connection state
+public enum SSEState: Sendable, Equatable {
+    case disconnected
+    case connecting
+    case connected
+}
+
+/// Protocol for SSE service (enables mocking)
+public protocol SSEServiceProtocol: Sendable {
+    func connect() async throws
+    func disconnect() async
+    var events: AsyncStream<WebSocketEvent> { get }
+    var state: SSEState { get async }
+}
+
+/// URLSession-based SSE service
+public actor SSEService: SSEServiceProtocol {
+    private let url: URL
+    private let session: URLSession
+    private var dataTask: Task<Void, Never>?
+
+    public func connect() async throws
+    public func disconnect() async
+    private func parseSSELine(_ line: String) -> WebSocketEvent?
+    private func processStream(_ bytes: URLSession.AsyncBytes) async
+}
+```
+
+**Line estimates per function:**
+- `connect()`: 20 lines
+- `disconnect()`: 10 lines
+- `parseSSELine()`: 18 lines
+- `processStream()`: 25 lines
+
+### 4. ConnectionManager (`ConnectionManager.swift`)
+
+**Purpose:** Orchestrates connection strategy with fallback chain.
+
+```swift
+/// Overall connection status exposed to UI
+public enum ConnectionStatus: Sendable, Equatable {
+    case disconnected
+    case connecting(ConnectionMethod)
+    case connected(ConnectionMethod)
+    case reconnecting(ConnectionMethod, attempt: Int)
+    case failed(String)  // Error description
+}
+
+/// Connection method in use
+public enum ConnectionMethod: String, Sendable, CaseIterable {
+    case webSocket
+    case sse
+    case restPolling
+}
+
+/// Manages connection fallback chain: WebSocket → SSE → REST
+@MainActor
+public final class ConnectionManager: ObservableObject {
+    @Published public private(set) var status: ConnectionStatus = .disconnected
+
+    private let webSocketService: any WebSocketServiceProtocol
+    private let sseService: any SSEServiceProtocol
+    private let apiClient: any HeimdallAPIClientProtocol
+    private let pollingInterval: TimeInterval
+
+    private var activeTask: Task<Void, Never>?
+    private var webSocketRetries: Int = 0
+    private var sseRetries: Int = 0
+    private let maxRetries: Int = 3
+
+    public init(
+        webSocketService: any WebSocketServiceProtocol,
+        sseService: any SSEServiceProtocol,
+        apiClient: any HeimdallAPIClientProtocol,
+        pollingInterval: TimeInterval = 5.0
+    )
+
+    public func start() async
+    public func stop() async
+    private func tryWebSocket() async -> Bool
+    private func trySSE() async -> Bool
+    private func startPolling() async
+    private func handleEvent(_ event: WebSocketEvent)
+}
+```
+
+**Fallback Strategy:**
+1. Try WebSocket connection to `ws://host:7846/ws/events`
+2. If WebSocket fails 3 times → fallback to SSE at `/api/events`
+3. If SSE fails 3 times → fallback to REST polling
+4. REST polling continues indefinitely (uses existing HeimdallAPIClient)
+
+**Line estimates per function:**
+- `start()`: 28 lines
+- `stop()`: 12 lines
+- `tryWebSocket()`: 22 lines
+- `trySSE()`: 20 lines
+- `startPolling()`: 24 lines
+- `handleEvent()`: 15 lines
+
+### 5. AppState (`AppState.swift`)
+
+**Purpose:** Central observable state container for the entire app.
+
+```swift
+/// Central application state container
+@MainActor
+public final class AppState: ObservableObject {
+    // Connection status
+    @Published public var connectionStatus: ConnectionStatus = .disconnected
+
+    // Live data from real-time events
+    @Published public var pipelines: [PipelineEntry] = []
+    @Published public var verdicts: [VerdictEntry] = []
+    @Published public var agents: [AgentHeartbeat] = []
+    @Published public var factoryStatus: FactoryStatus = .stalled
+
+    // Services
+    private let connectionManager: ConnectionManager
+
+    public init(connectionManager: ConnectionManager)
+
+    public func start() async
+    public func stop() async
+
+    // Called by ConnectionManager when events arrive
+    internal func handleEvent(_ event: WebSocketEvent)
+}
+```
+
+**Line estimates per function:**
+- `init()`: 12 lines
+- `start()`: 18 lines
+- `stop()`: 10 lines
+- `handleEvent()`: 28 lines
 
 ---
 
-## File Operations Table
+## Data Path Trace
 
-| Operation | Path | Description |
-|-----------|------|-------------|
-| CREATE | Package.swift | SPM manifest with SwiftUI, SwiftData, Charts |
-| CREATE | Sources/HEIMDALLControlSurface/App.swift | Main app entry point |
-| CREATE | Sources/HEIMDALLControlSurface/ContentView.swift | Root view placeholder |
-| CREATE | Sources/HEIMDALLControlSurface/Models/.gitkeep | Models directory placeholder |
-| CREATE | Sources/HEIMDALLControlSurface/Views/.gitkeep | Views directory placeholder |
-| CREATE | Sources/HEIMDALLControlSurface/Services/.gitkeep | Services directory placeholder |
-| CREATE | Tests/HEIMDALLControlSurfaceTests/ModelTests.swift | Model test placeholder |
-| CREATE | Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift | Service test placeholder |
-| CREATE | Tests/HEIMDALLControlSurfaceTests/ViewTests.swift | View test placeholder |
-| CREATE | Resources/Assets.xcassets/Contents.json | Asset catalog root |
-| CREATE | Resources/Assets.xcassets/AppIcon.appiconset/Contents.json | App icon set |
-| CREATE | README.md | Build instructions |
-| MODIFY | .gitignore | Add Swift-specific ignores |
+### WebSocket Event Flow
 
----
+1. **WebSocketService.receiveMessages()** (line ~60)
+   - Calls `webSocketTask.receive()` in loop
+   - Decodes `WebSocketEvent` from JSON `.string` message
+   - Yields event to `AsyncStream<WebSocketEvent>`
 
-## Detailed Implementation
+2. **ConnectionManager.tryWebSocket()** (line ~45)
+   - Awaits `for await event in webSocketService.events`
+   - Calls `handleEvent(event)`
 
-### 1. Package.swift
+3. **ConnectionManager.handleEvent()** (line ~95)
+   - Forwards event to `AppState` via callback or direct reference
 
-```swift
-// swift-tools-version: 6.0
+4. **AppState.handleEvent()** (line ~55)
+   - Pattern matches on `event.type`
+   - Decodes type-specific payload from `event.payload`
+   - Updates appropriate `@Published` property
+   - SwiftUI views auto-refresh via Combine
 
-import PackageDescription
+### Fallback Chain Activation
 
-let package = Package(
-    name: "HEIMDALLControlSurface",
-    platforms: [
-        .macOS(.v14)
-    ],
-    products: [
-        .executable(
-            name: "HEIMDALLControlSurface",
-            targets: ["HEIMDALLControlSurface"]
-        )
-    ],
-    targets: [
-        .executableTarget(
-            name: "HEIMDALLControlSurface",
-            resources: [
-                .process("../../Resources")
-            ]
-        ),
-        .testTarget(
-            name: "HEIMDALLControlSurfaceTests",
-            dependencies: ["HEIMDALLControlSurface"]
-        )
-    ]
-)
-```
+1. **ConnectionManager.start()** (line ~25)
+   - Calls `tryWebSocket()`
+   - On success: remains in WebSocket mode
+   - On failure: increments `webSocketRetries`
 
-**Notes:**
-- macOS 14+ required for SwiftData
-- SwiftUI, SwiftData, and Charts are part of SDK (no external dependencies)
-- Resources processed from Resources/ directory
+2. **ConnectionManager.tryWebSocket()** (line ~45)
+   - Catches connection error after `maxRetries` (3)
+   - Updates `status = .connecting(.sse)`
+   - Calls `trySSE()`
 
-### 2. Sources/HEIMDALLControlSurface/App.swift
+3. **ConnectionManager.trySSE()** (line ~70)
+   - Catches connection error after `maxRetries` (3)
+   - Updates `status = .connecting(.restPolling)`
+   - Calls `startPolling()`
 
-```swift
-import SwiftUI
-import SwiftData
-
-@main
-struct HEIMDALLControlSurfaceApp: App {
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-        }
-    }
-}
-```
-
-### 3. Sources/HEIMDALLControlSurface/ContentView.swift
-
-```swift
-import SwiftUI
-import Charts
-
-struct ContentView: View {
-    var body: some View {
-        VStack {
-            Text("HEIMDALL Control Surface")
-                .font(.largeTitle)
-            Text("v0.1.0")
-                .foregroundStyle(.secondary)
-        }
-        .padding()
-    }
-}
-
-#Preview {
-    ContentView()
-}
-```
-
-### 4. Test Files
-
-**Tests/HEIMDALLControlSurfaceTests/ModelTests.swift:**
-```swift
-import Testing
-@testable import HEIMDALLControlSurface
-
-@Suite("Model Tests")
-struct ModelTests {
-    @Test func placeholder() async throws {
-        // Placeholder test - to be implemented with models
-        #expect(true)
-    }
-}
-```
-
-**Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift:**
-```swift
-import Testing
-@testable import HEIMDALLControlSurface
-
-@Suite("Service Tests")
-struct ServiceTests {
-    @Test func placeholder() async throws {
-        // Placeholder test - to be implemented with services
-        #expect(true)
-    }
-}
-```
-
-**Tests/HEIMDALLControlSurfaceTests/ViewTests.swift:**
-```swift
-import Testing
-@testable import HEIMDALLControlSurface
-
-@Suite("View Tests")
-struct ViewTests {
-    @Test func placeholder() async throws {
-        // Placeholder test - to be implemented with views
-        #expect(true)
-    }
-}
-```
-
-### 5. Resources/Assets.xcassets
-
-**Resources/Assets.xcassets/Contents.json:**
-```json
-{
-  "info" : {
-    "author" : "xcode",
-    "version" : 1
-  }
-}
-```
-
-**Resources/Assets.xcassets/AppIcon.appiconset/Contents.json:**
-```json
-{
-  "images" : [
-    {
-      "idiom" : "mac",
-      "scale" : "1x",
-      "size" : "16x16"
-    },
-    {
-      "idiom" : "mac",
-      "scale" : "2x",
-      "size" : "16x16"
-    },
-    {
-      "idiom" : "mac",
-      "scale" : "1x",
-      "size" : "32x32"
-    },
-    {
-      "idiom" : "mac",
-      "scale" : "2x",
-      "size" : "32x32"
-    },
-    {
-      "idiom" : "mac",
-      "scale" : "1x",
-      "size" : "128x128"
-    },
-    {
-      "idiom" : "mac",
-      "scale" : "2x",
-      "size" : "128x128"
-    },
-    {
-      "idiom" : "mac",
-      "scale" : "1x",
-      "size" : "256x256"
-    },
-    {
-      "idiom" : "mac",
-      "scale" : "2x",
-      "size" : "256x256"
-    },
-    {
-      "idiom" : "mac",
-      "scale" : "1x",
-      "size" : "512x512"
-    },
-    {
-      "idiom" : "mac",
-      "scale" : "2x",
-      "size" : "512x512"
-    }
-  ],
-  "info" : {
-    "author" : "xcode",
-    "version" : 1
-  }
-}
-```
-
-### 6. README.md
-
-```markdown
-# HEIMDALL Control Surface
-
-A macOS application for monitoring and controlling HEIMDALL-managed projects.
-
-## Requirements
-
-- macOS 14.0+
-- Swift 6.0+
-- Xcode 16.0+ (for development)
-
-## Build
-
-```bash
-swift build
-```
-
-## Run
-
-```bash
-swift run
-```
-
-## Test
-
-```bash
-swift test
-```
-
-## Project Structure
-
-```
-HEIMDALLControlSurface/
-├── Package.swift
-├── Sources/
-│   └── HEIMDALLControlSurface/
-│       ├── App.swift              # Application entry point
-│       ├── ContentView.swift      # Root view
-│       ├── Models/                # Data models (SwiftData)
-│       ├── Views/                 # SwiftUI views
-│       └── Services/              # Business logic & API clients
-├── Tests/
-│   └── HEIMDALLControlSurfaceTests/
-│       ├── ModelTests.swift
-│       ├── ServiceTests.swift
-│       └── ViewTests.swift
-└── Resources/
-    └── Assets.xcassets/           # App icons and images
-```
-
-## Architecture
-
-- **SwiftUI** - Declarative UI framework
-- **SwiftData** - Data persistence
-- **Swift Charts** - Data visualization
-
-## License
-
-Proprietary - Solutions4.AI
-```
-
-### 7. .gitignore Additions
-
-Append to existing .gitignore:
-```
-# Swift
-.build/
-.swiftpm/
-Package.resolved
-*.xcodeproj
-*.xcworkspace
-DerivedData/
-xcuserdata/
-```
+4. **ConnectionManager.startPolling()** (line ~95)
+   - Uses existing `HeimdallAPIClient.fetchPipeline()`
+   - Polls every `pollingInterval` (5 seconds)
+   - Wraps REST response in `WebSocketEvent` format
+   - Continues indefinitely until `stop()` called
 
 ---
 
 ## Function Size Plan
 
-**Not applicable** - All files are new creations with minimal code. No existing functions to modify. All new functions are under 10 lines.
+All functions planned to be under 50 lines. Detailed breakdown:
 
-| File | Function | Lines |
-|------|----------|-------|
-| App.swift | body (computed property) | 5 |
-| ContentView.swift | body (computed property) | 9 |
-| ModelTests.swift | placeholder() | 3 |
-| ServiceTests.swift | placeholder() | 3 |
-| ViewTests.swift | placeholder() | 3 |
+| File | Function | Planned Lines | Notes |
+|------|----------|---------------|-------|
+| Event.swift | (models only) | N/A | No functions, just structs/enums |
+| WebSocketService.swift | `init()` | 8 | Simple property initialization |
+| WebSocketService.swift | `reconnectDelay()` | 8 | min(baseDelay * 2^attempt, maxDelay) |
+| WebSocketService.swift | `connect()` | 22 | Create task, setup continuation |
+| WebSocketService.swift | `disconnect()` | 12 | Cancel task, nil out references |
+| WebSocketService.swift | `receiveMessages()` | 28 | Receive loop with decode |
+| WebSocketService.swift | `scheduleReconnect()` | 18 | Delay + recursive connect |
+| SSEService.swift | `init()` | 6 | Simple initialization |
+| SSEService.swift | `connect()` | 20 | Setup bytes stream |
+| SSEService.swift | `disconnect()` | 10 | Cancel task |
+| SSEService.swift | `parseSSELine()` | 18 | Parse "data:" prefix, decode JSON |
+| SSEService.swift | `processStream()` | 25 | Read lines, yield events |
+| ConnectionManager.swift | `init()` | 10 | Store dependencies |
+| ConnectionManager.swift | `start()` | 28 | Orchestrate fallback chain |
+| ConnectionManager.swift | `stop()` | 12 | Cancel active task |
+| ConnectionManager.swift | `tryWebSocket()` | 22 | Connect + handle events |
+| ConnectionManager.swift | `trySSE()` | 20 | Connect + handle events |
+| ConnectionManager.swift | `startPolling()` | 24 | Polling loop |
+| ConnectionManager.swift | `handleEvent()` | 15 | Forward to AppState |
+| AppState.swift | `init()` | 12 | Setup bindings |
+| AppState.swift | `start()` | 18 | Start ConnectionManager |
+| AppState.swift | `stop()` | 10 | Stop ConnectionManager |
+| AppState.swift | `handleEvent()` | 28 | Switch on event type, update state |
+
+**All functions ≤ 28 lines — well under 50-line limit.**
+
+---
+
+## Test Strategy
+
+### File: `Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift`
+
+Replace placeholder test with comprehensive test suite:
+
+**WebSocket Tests:**
+```swift
+@Suite("WebSocket Service Tests")
+struct WebSocketServiceTests {
+    @Test func connectsToValidURL() async throws
+    @Test func yieldsEventsOnMessage() async throws
+    @Test func exponentialBackoffCalculation() async throws
+    @Test func maxReconnectDelayCapped() async throws
+    @Test func disconnectCancelsTask() async throws
+}
+```
+
+**SSE Tests:**
+```swift
+@Suite("SSE Service Tests")
+struct SSEServiceTests {
+    @Test func parsesDataLine() async throws
+    @Test func ignoresCommentLines() async throws
+    @Test func handlesMultilineData() async throws
+}
+```
+
+**ConnectionManager Tests:**
+```swift
+@Suite("Connection Manager Tests")
+struct ConnectionManagerTests {
+    @Test func startsWithWebSocket() async throws
+    @Test func fallsBackToSSEAfterRetries() async throws
+    @Test func fallsBackToPollingAfterSSEFails() async throws
+    @Test func reportsCorrectStatus() async throws
+    @Test func stopCancelsActiveConnection() async throws
+}
+```
+
+**AppState Tests:**
+```swift
+@Suite("AppState Tests")
+struct AppStateTests {
+    @Test func updatesOnFactoryEvent() async throws
+    @Test func updatesOnVerdictEvent() async throws
+    @Test func exposesConnectionStatus() async throws
+}
+```
+
+### Mock Infrastructure
+
+Create mocks for testing:
+
+```swift
+// In ServiceTests.swift
+actor MockWebSocketService: WebSocketServiceProtocol {
+    var shouldFail: Bool = false
+    var eventsToYield: [WebSocketEvent] = []
+    private(set) var state: WebSocketState = .disconnected
+
+    var events: AsyncStream<WebSocketEvent> { ... }
+    func connect() async throws { ... }
+    func disconnect() async { ... }
+}
+
+actor MockSSEService: SSEServiceProtocol {
+    var shouldFail: Bool = false
+    var eventsToYield: [WebSocketEvent] = []
+    private(set) var state: SSEState = .disconnected
+
+    var events: AsyncStream<WebSocketEvent> { ... }
+    func connect() async throws { ... }
+    func disconnect() async { ... }
+}
+```
 
 ---
 
 ## Verification Plan
 
-### Automated Verification
-1. **Build verification**: `swift build` must complete without errors
-2. **Test verification**: `swift test` must run and pass all placeholder tests
-3. **No .xcodeproj check**: Verify no Xcode project files exist
-
-### Manual Verification Checklist
-- [ ] Package.swift declares macOS 14+ platform
-- [ ] Sources/ directory structure matches specification
-- [ ] Tests/ contains ModelTests, ServiceTests, ViewTests
-- [ ] Resources/ contains Assets.xcassets
-- [ ] README.md includes build instructions
-- [ ] .gitignore includes Swift patterns
+| Acceptance Criterion | Test Method | Verification |
+|---------------------|-------------|--------------|
+| WebSocket connects to ws://host:7846/ws/events | `@Test connectsToValidURL` | Mock verifies URL passed |
+| Factory events update AppState | `@Test updatesOnFactoryEvent` | Check `@Published` property |
+| Automatic reconnection with exponential backoff | `@Test exponentialBackoffCalculation` | Verify delays: 1s→2s→4s→...→30s |
+| Graceful fallback to SSE | `@Test fallsBackToSSEAfterRetries` | Status changes after 3 WS failures |
+| Graceful fallback to REST | `@Test fallsBackToPollingAfterSSEFails` | Status changes after 3 SSE failures |
+| Connection status visible in AppState | `@Test exposesConnectionStatus` | Verify `connectionStatus` updates |
+| No memory leaks | Manual | Verify weak refs, task cancellation |
 
 ---
 
-## Risk Assessment
+## Risks & Mitigations
 
 | Risk | Mitigation |
 |------|------------|
-| Swift 6 syntax changes | Using stable APIs only |
-| Resource path resolution | Using .process() for automatic handling |
-| SwiftData import in App.swift | Required for future @Model decorators |
+| URLSession WebSocket not available on older macOS | Target macOS 14+ (already in Package.swift) |
+| Memory leaks from uncancelled tasks | Use structured concurrency, cancel in `disconnect()` |
+| Race conditions in reconnect logic | Use actor isolation for WebSocketService/SSEService |
+| Event payload schema mismatch | Use optional fields with defaults, log decode warnings |
+| Connection manager state corruption | @MainActor isolation, single `activeTask` |
+
+---
+
+## Commit Plan
+
+**Commit 1:** Event models (HCS-004)
+- `Sources/HEIMDALLControlSurface/Models/Event.swift`
+
+**Commit 2:** WebSocket service (HCS-004)
+- `Sources/HEIMDALLControlSurface/Services/WebSocketService.swift`
+
+**Commit 3:** SSE fallback (HCS-004)
+- `Sources/HEIMDALLControlSurface/Services/SSEService.swift`
+
+**Commit 4:** Connection manager + AppState (HCS-004)
+- `Sources/HEIMDALLControlSurface/Services/ConnectionManager.swift`
+- `Sources/HEIMDALLControlSurface/State/AppState.swift`
+
+**Commit 5:** Tests (HCS-004)
+- `Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift`
+
+Each commit ≤ 5 files per Rule 4.
 
 ---
 
@@ -407,85 +535,43 @@ xcuserdata/
 
 ```json
 {
-  "issue_ref": "HCS-001",
+  "issue_ref": "HCS-004",
   "deliverables": [
     {
-      "file": "Package.swift",
+      "file": "Sources/HEIMDALLControlSurface/Models/Event.swift",
       "function": "",
-      "change_description": "CREATE SPM manifest with macOS 14+ platform, executable target, test target, and resource processing",
-      "verification": "swift build succeeds"
+      "change_description": "CREATE: WebSocket event models (EventType enum, WebSocketEvent struct, FactoryUpdatePayload, VerdictPayload, HeartbeatPayload)",
+      "verification": "swift build compiles without errors"
     },
     {
-      "file": "Sources/HEIMDALLControlSurface/App.swift",
-      "function": "HEIMDALLControlSurfaceApp",
-      "change_description": "CREATE main app entry point with @main attribute and WindowGroup scene",
-      "verification": "swift build succeeds, app launches"
+      "file": "Sources/HEIMDALLControlSurface/Services/WebSocketService.swift",
+      "function": "WebSocketService (actor)",
+      "change_description": "CREATE: Actor-based WebSocket service with connect(), disconnect(), receiveMessages(), exponential backoff reconnection (1s→30s cap)",
+      "verification": "@Test connectsToValidURL, @Test exponentialBackoffCalculation, @Test maxReconnectDelayCapped"
     },
     {
-      "file": "Sources/HEIMDALLControlSurface/ContentView.swift",
-      "function": "ContentView",
-      "change_description": "CREATE root SwiftUI view with placeholder content importing Charts",
-      "verification": "swift build succeeds"
+      "file": "Sources/HEIMDALLControlSurface/Services/SSEService.swift",
+      "function": "SSEService (actor)",
+      "change_description": "CREATE: Actor-based SSE fallback service with connect(), disconnect(), parseSSELine(), processStream()",
+      "verification": "@Test parsesDataLine, @Test ignoresCommentLines"
     },
     {
-      "file": "Sources/HEIMDALLControlSurface/Models/.gitkeep",
-      "function": "",
-      "change_description": "CREATE empty placeholder for Models directory",
-      "verification": "Directory exists"
+      "file": "Sources/HEIMDALLControlSurface/Services/ConnectionManager.swift",
+      "function": "ConnectionManager (@MainActor class)",
+      "change_description": "CREATE: ObservableObject that orchestrates WebSocket → SSE → REST fallback with ConnectionStatus enum, maxRetries=3",
+      "verification": "@Test fallsBackToSSEAfterRetries, @Test fallsBackToPollingAfterSSEFails, @Test reportsCorrectStatus"
     },
     {
-      "file": "Sources/HEIMDALLControlSurface/Views/.gitkeep",
-      "function": "",
-      "change_description": "CREATE empty placeholder for Views directory",
-      "verification": "Directory exists"
-    },
-    {
-      "file": "Sources/HEIMDALLControlSurface/Services/.gitkeep",
-      "function": "",
-      "change_description": "CREATE empty placeholder for Services directory",
-      "verification": "Directory exists"
-    },
-    {
-      "file": "Tests/HEIMDALLControlSurfaceTests/ModelTests.swift",
-      "function": "ModelTests",
-      "change_description": "CREATE test suite with placeholder test using Swift Testing framework",
-      "verification": "swift test passes"
+      "file": "Sources/HEIMDALLControlSurface/State/AppState.swift",
+      "function": "AppState (@MainActor class)",
+      "change_description": "CREATE: Central ObservableObject with @Published properties for pipelines, verdicts, agents, factoryStatus, connectionStatus. handleEvent() dispatches by type.",
+      "verification": "@Test updatesOnFactoryEvent, @Test updatesOnVerdictEvent, @Test exposesConnectionStatus"
     },
     {
       "file": "Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift",
-      "function": "ServiceTests",
-      "change_description": "CREATE test suite with placeholder test using Swift Testing framework",
-      "verification": "swift test passes"
-    },
-    {
-      "file": "Tests/HEIMDALLControlSurfaceTests/ViewTests.swift",
-      "function": "ViewTests",
-      "change_description": "CREATE test suite with placeholder test using Swift Testing framework",
-      "verification": "swift test passes"
-    },
-    {
-      "file": "Resources/Assets.xcassets/Contents.json",
       "function": "",
-      "change_description": "CREATE asset catalog root manifest",
-      "verification": "Valid JSON, swift build succeeds"
-    },
-    {
-      "file": "Resources/Assets.xcassets/AppIcon.appiconset/Contents.json",
-      "function": "",
-      "change_description": "CREATE app icon set manifest for macOS icons",
-      "verification": "Valid JSON with macOS icon sizes"
-    },
-    {
-      "file": "README.md",
-      "function": "",
-      "change_description": "CREATE project documentation with build instructions, structure, and requirements",
-      "verification": "Contains swift build/run/test commands"
-    },
-    {
-      "file": ".gitignore",
-      "function": "",
-      "change_description": "MODIFY to append Swift-specific ignore patterns (.build/, .swiftpm/, etc.)",
-      "verification": ".build/ and .swiftpm/ patterns present"
+      "change_description": "MODIFY: Replace placeholder with WebSocketServiceTests, SSEServiceTests, ConnectionManagerTests, AppStateTests suites. Add MockWebSocketService, MockSSEService.",
+      "verification": "swift test passes all new tests"
     }
   ]
 }
