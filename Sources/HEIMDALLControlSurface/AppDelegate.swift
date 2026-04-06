@@ -3,6 +3,7 @@
 
 import AppKit
 import Carbon.HIToolbox
+import UserNotifications
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -10,12 +11,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkeyRef: EventHotKeyRef?
     /// Event handler reference
     private var eventHandler: EventHandlerRef?
+    /// Notification delegate for handling user actions (HCS-006)
+    private(set) var notificationDelegate: NotificationDelegate?
+    /// Notification service (HCS-006)
+    private(set) var notificationService: NotificationService?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Hide dock icon for menu bar app
         NSApp.setActivationPolicy(.accessory)
         // Set up global hotkey (Cmd+Shift+H)
         setupGlobalHotkey()
+        // Set up notifications (HCS-006)
+        setupNotifications()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -50,6 +57,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let handler = eventHandler {
             RemoveEventHandler(handler)
+        }
+    }
+
+    /// Set up notification service and request permission (HCS-006)
+    private func setupNotifications() {
+        notificationService = NotificationService()
+        notificationService?.registerCategories()
+
+        notificationDelegate = NotificationDelegate()
+        UNUserNotificationCenter.current().delegate = notificationDelegate
+
+        // Request permission (non-blocking)
+        Task {
+            _ = try? await notificationService?.requestAuthorization()
         }
     }
 }

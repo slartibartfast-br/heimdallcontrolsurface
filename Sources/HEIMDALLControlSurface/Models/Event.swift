@@ -12,6 +12,7 @@ public enum EventType: String, Codable, Sendable {
     case heartbeat = "heartbeat"
     case pipelineUpdate = "pipeline_update"
     case agentStatus = "agent_status"
+    case escalation = "escalation"  // HCS-006: explicit escalation events
 }
 
 // MARK: - WebSocket Event Wrapper

@@ -1,35 +1,28 @@
-# PLAN: HCS-004 — WebSocket Service
+# PLAN: HCS-006 — Notification Service
 
 ## Preflight Checklist
 
 ### git status
 ```
-On branch feat/AASF-648
+On branch feat/AASF-672
 Untracked files:
   (use "git add <file>..." to include in what will be committed)
-	Sources/HEIMDALLControlSurface/Models/Agent.swift
-	Sources/HEIMDALLControlSurface/Models/Infrastructure.swift
-	Sources/HEIMDALLControlSurface/Models/KPI.swift
-	Sources/HEIMDALLControlSurface/Models/Pipeline.swift
-	Sources/HEIMDALLControlSurface/Models/Project.swift
-	Sources/HEIMDALLControlSurface/Models/Verdict.swift
-	Sources/HEIMDALLControlSurface/Services/HeimdallAPIClient.swift
-	Sources/HEIMDALLControlSurface/Services/JSONDecoding.swift
-	Sources/HEIMDALLControlSurface/Services/MockAPIClient.swift
+	.mcp.json.heimdall-backup
 
 nothing added to commit but untracked files present (use "git add" to track)
 ```
 
 ### git branch
 ```
-+ feat/AASF-646
-* feat/AASF-648
++ feat/AASF-647
++ feat/AASF-671
+* feat/AASF-672
 + main
 ```
 
 ### ls data/queue/
 ```
-ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-648/data/queue/: No such file or directory
+ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-672/data/queue/: No such file or directory
 ```
 (No queue directory exists — this is a Swift project, no stale envelopes)
 
@@ -41,7 +34,7 @@ ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-648/data/queue/: No
 5. One branch at a time
 6. Squash merge to main
 7. Every commit: (HCS-NNN)
-8. python -m pytest tests/ -q must pass before merge
+8. python -m pytest tests/ -q must pass before merge (N/A — Swift project uses `swift test`)
 
 ---
 
@@ -49,12 +42,13 @@ ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-648/data/queue/: No
 
 | Action | File | Purpose |
 |--------|------|---------|
-| CREATE | `Sources/.../Models/Event.swift` | WebSocket event models (factory_update, verdict, heartbeat) |
-| CREATE | `Sources/.../Services/WebSocketService.swift` | URLSession WebSocket connection with exponential backoff |
-| CREATE | `Sources/.../Services/SSEService.swift` | Server-Sent Events fallback service |
-| CREATE | `Sources/.../Services/ConnectionManager.swift` | Orchestrates WebSocket → SSE → REST fallback |
-| CREATE | `Sources/.../State/AppState.swift` | Observable state container for live updates |
-| MODIFY | `Tests/.../ServiceTests.swift` | Add WebSocket, SSE, ConnectionManager tests |
+| CREATE | `Sources/.../Services/NotificationService.swift` | UNUserNotificationCenter wrapper for macOS notifications |
+| CREATE | `Sources/.../Services/NotificationCategory.swift` | Notification categories with approve/reject action buttons |
+| CREATE | `Sources/.../Services/NotificationDelegate.swift` | Handle user responses from notification center actions |
+| MODIFY | `Sources/.../AppState.swift` | Add escalation event storage and notification triggering |
+| MODIFY | `Sources/.../AppDelegate.swift` | Initialize notification permissions on first launch |
+| MODIFY | `Sources/.../Models/Event.swift` | Add `escalation` event type for notifications |
+| MODIFY | `Tests/.../ServiceTests.swift` | Add NotificationService, category, and delegate tests |
 
 ---
 
@@ -63,471 +57,679 @@ ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-648/data/queue/: No
 ### Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                      AppState                            │
-│   @Published pipelines, verdicts, connectionStatus       │
-└────────────────────────┬────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│                  ConnectionManager                       │
-│   Orchestrates: WebSocket → SSE → REST polling          │
-│   Tracks: ConnectionStatus, retry logic                 │
-└───────┬──────────────────┬──────────────────┬───────────┘
-        │                  │                  │
-        ▼                  ▼                  ▼
-┌───────────────┐  ┌───────────────┐  ┌────────────────────┐
-│WebSocketService│ │  SSEService   │  │ HeimdallAPIClient  │
-│ws://host/ws/  │  │ /api/events   │  │  REST polling      │
-│   events      │  │   (SSE)       │  │  (existing)        │
-└───────────────┘  └───────────────┘  └────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                         AppState                             │
+│   @Published escalations: [EscalationEntry]                  │
+│   func handleEscalation(event) → triggers notification       │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   NotificationService                        │
+│   - requestAuthorization()                                   │
+│   - showEscalationNotification(escalation, issueId)          │
+│   - registerCategories()                                     │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+        ┌────────────┼────────────┐
+        ▼            ▼            ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────────────────┐
+│ Category:    │ │ Category:    │ │ NotificationDelegate     │
+│ escalation   │ │ verdict      │ │ UNUserNotificationCenter │
+│ [Approve]    │ │ [View]       │ │ Delegate                 │
+│ [Reject]     │ │              │ │ - didReceive response    │
+└──────────────┘ └──────────────┘ └──────────────────────────┘
+                                             │
+                                             ▼
+                                  ┌──────────────────────────┐
+                                  │   HeimdallAPIClient      │
+                                  │   approve() / reject()   │
+                                  └──────────────────────────┘
 ```
 
-### 1. Event Models (`Event.swift`)
+### Data Path Trace
 
-**Purpose:** Strongly-typed models for real-time WebSocket events.
+**Escalation Event Flow:**
+1. `WebSocketService.receiveMessages()` (line 84-97) receives event
+2. `WebSocketService.parseMessage()` (line 99-109) parses to `WebSocketEvent`
+3. `ConnectionManager.handleEvent()` (line 165-167) forwards to `eventHandler`
+4. `AppState.handleEvent()` (new) filters for `.escalation` or `.verdict` with `.escalate` outcome
+5. `AppState.handleEscalation()` (new) stores escalation and calls `NotificationService.showEscalationNotification()`
+6. User clicks action button in notification
+7. `NotificationDelegate.userNotificationCenter(_:didReceive:)` (new) extracts action and issueId
+8. `HeimdallAPIClient.approve()` or `reject()` (lines 112-120) posts decision
+
+---
+
+## Implementation Details
+
+### 1. NotificationCategory.swift (CREATE)
+
+**Purpose:** Define notification categories with action buttons.
 
 ```swift
-// Event types matching HEIMDALL monitor backend
+// Sources/HEIMDALLControlSurface/Services/NotificationCategory.swift
+// HCS-006: Notification categories for escalation actions
+
+import UserNotifications
+
+/// Notification category identifiers
+public enum NotificationCategoryID: String {
+    case escalation = "ESCALATION"
+    case verdict = "VERDICT"
+    case error = "ERROR"
+}
+
+/// Notification action identifiers
+public enum NotificationActionID: String {
+    case approve = "APPROVE_ACTION"
+    case reject = "REJECT_ACTION"
+    case view = "VIEW_ACTION"
+    case dismiss = "DISMISS_ACTION"
+}
+
+/// Creates and registers notification categories
+public struct NotificationCategories {
+    /// Create escalation category with approve/reject buttons
+    public static func escalationCategory() -> UNNotificationCategory {
+        let approveAction = UNNotificationAction(
+            identifier: NotificationActionID.approve.rawValue,
+            title: "Approve",
+            options: [.foreground]
+        )
+        let rejectAction = UNNotificationAction(
+            identifier: NotificationActionID.reject.rawValue,
+            title: "Reject",
+            options: [.destructive, .foreground]
+        )
+        return UNNotificationCategory(
+            identifier: NotificationCategoryID.escalation.rawValue,
+            actions: [approveAction, rejectAction],
+            intentIdentifiers: [],
+            options: [.customDismissAction]
+        )
+    }
+
+    /// Create verdict category with view button
+    public static func verdictCategory() -> UNNotificationCategory {
+        let viewAction = UNNotificationAction(
+            identifier: NotificationActionID.view.rawValue,
+            title: "View Details",
+            options: [.foreground]
+        )
+        return UNNotificationCategory(
+            identifier: NotificationCategoryID.verdict.rawValue,
+            actions: [viewAction],
+            intentIdentifiers: [],
+            options: []
+        )
+    }
+
+    /// Create error category (dismiss only)
+    public static func errorCategory() -> UNNotificationCategory {
+        return UNNotificationCategory(
+            identifier: NotificationCategoryID.error.rawValue,
+            actions: [],
+            intentIdentifiers: [],
+            options: []
+        )
+    }
+
+    /// All categories for registration
+    public static func allCategories() -> Set<UNNotificationCategory> {
+        [escalationCategory(), verdictCategory(), errorCategory()]
+    }
+}
+```
+
+**Line count:** ~50 lines (struct + 4 factory methods)
+
+---
+
+### 2. NotificationService.swift (CREATE)
+
+**Purpose:** UNUserNotificationCenter wrapper for scheduling notifications.
+
+```swift
+// Sources/HEIMDALLControlSurface/Services/NotificationService.swift
+// HCS-006: macOS notification service for escalation alerts
+
+import Foundation
+import UserNotifications
+
+/// Protocol for notification service (enables mocking)
+public protocol NotificationServiceProtocol: Sendable {
+    func requestAuthorization() async throws -> Bool
+    func showEscalationNotification(issueId: String, gate: String, reason: String) async throws
+    func showVerdictNotification(issueId: String, outcome: String, reason: String) async throws
+    func showErrorNotification(title: String, message: String) async throws
+    func registerCategories()
+}
+
+/// UNUserNotificationCenter-based notification service
+public final class NotificationService: NotificationServiceProtocol, @unchecked Sendable {
+    private let center: UNUserNotificationCenter
+
+    public init(center: UNUserNotificationCenter = .current()) {
+        self.center = center
+    }
+
+    /// Register notification categories on init
+    public func registerCategories() {
+        center.setNotificationCategories(NotificationCategories.allCategories())
+    }
+
+    /// Request notification authorization
+    public func requestAuthorization() async throws -> Bool {
+        try await center.requestAuthorization(options: [.alert, .sound, .badge])
+    }
+
+    /// Show escalation notification with approve/reject actions
+    public func showEscalationNotification(
+        issueId: String,
+        gate: String,
+        reason: String
+    ) async throws {
+        let content = UNMutableNotificationContent()
+        content.title = "Escalation Required"
+        content.subtitle = "\(issueId) — \(gate) gate"
+        content.body = reason
+        content.sound = .default
+        content.categoryIdentifier = NotificationCategoryID.escalation.rawValue
+        content.userInfo = ["issueId": issueId, "gate": gate]
+
+        let request = UNNotificationRequest(
+            identifier: "escalation-\(issueId)-\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil  // Immediate
+        )
+        try await center.add(request)
+    }
+
+    /// Show verdict notification with view action
+    public func showVerdictNotification(
+        issueId: String,
+        outcome: String,
+        reason: String
+    ) async throws {
+        let content = UNMutableNotificationContent()
+        content.title = "Verdict: \(outcome.capitalized)"
+        content.subtitle = issueId
+        content.body = reason
+        content.sound = .default
+        content.categoryIdentifier = NotificationCategoryID.verdict.rawValue
+        content.userInfo = ["issueId": issueId]
+
+        let request = UNNotificationRequest(
+            identifier: "verdict-\(issueId)-\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+        try await center.add(request)
+    }
+
+    /// Show error notification
+    public func showErrorNotification(title: String, message: String) async throws {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = message
+        content.sound = .defaultCritical
+        content.categoryIdentifier = NotificationCategoryID.error.rawValue
+
+        let request = UNNotificationRequest(
+            identifier: "error-\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+        try await center.add(request)
+    }
+}
+```
+
+**Line count:** ~75 lines total (class + 5 methods, each under 20 lines)
+
+---
+
+### 3. NotificationDelegate.swift (CREATE)
+
+**Purpose:** Handle user responses from notification center.
+
+```swift
+// Sources/HEIMDALLControlSurface/Services/NotificationDelegate.swift
+// HCS-006: UNUserNotificationCenter delegate for handling user actions
+
+import Foundation
+import UserNotifications
+
+/// Protocol for notification response handling (enables testing)
+public protocol NotificationResponseHandler: AnyObject, Sendable {
+    @MainActor func handleApprove(issueId: String) async
+    @MainActor func handleReject(issueId: String) async
+    @MainActor func handleViewIssue(issueId: String)
+}
+
+/// UNUserNotificationCenter delegate for inline action handling
+@MainActor
+public final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+    public weak var responseHandler: (any NotificationResponseHandler)?
+
+    public override init() {
+        super.init()
+    }
+
+    /// Handle user response to notification action
+    public func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let userInfo = response.notification.request.content.userInfo
+        let issueId = userInfo["issueId"] as? String ?? ""
+
+        Task { @MainActor in
+            await handleAction(response.actionIdentifier, issueId: issueId)
+            completionHandler()
+        }
+    }
+
+    /// Route action to appropriate handler
+    private func handleAction(_ actionId: String, issueId: String) async {
+        switch actionId {
+        case NotificationActionID.approve.rawValue:
+            await responseHandler?.handleApprove(issueId: issueId)
+        case NotificationActionID.reject.rawValue:
+            await responseHandler?.handleReject(issueId: issueId)
+        case NotificationActionID.view.rawValue:
+            responseHandler?.handleViewIssue(issueId: issueId)
+        case UNNotificationDefaultActionIdentifier:
+            // User clicked notification body — open dashboard
+            responseHandler?.handleViewIssue(issueId: issueId)
+        default:
+            break
+        }
+    }
+
+    /// Handle notification presentation while app is in foreground
+    public func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        // Always show notifications even when app is active
+        completionHandler([.banner, .sound])
+    }
+}
+```
+
+**Line count:** ~55 lines (class + 3 methods, each under 25 lines)
+
+---
+
+### 4. AppState.swift (MODIFY)
+
+**Current state:** 29 lines, simple observable with dashboard/connection state.
+
+**Changes:**
+- Add `escalations: [EscalationEntry]` property
+- Add `notificationService` dependency
+- Add `handleEscalation()` method
+- Conform to `ConnectionEventHandler` protocol
+- Conform to `NotificationResponseHandler` protocol
+
+```swift
+// Add to AppState.swift after line 17
+
+    // Pending escalations requiring user action
+    var escalations: [EscalationEntry] = []
+
+    // Notification service (injected)
+    private var notificationService: (any NotificationServiceProtocol)?
+    private var apiClient: (any HeimdallAPIClientProtocol)?
+
+    // Configure services (called from AppDelegate)
+    func configure(
+        notificationService: any NotificationServiceProtocol,
+        apiClient: any HeimdallAPIClientProtocol
+    ) {
+        self.notificationService = notificationService
+        self.apiClient = apiClient
+    }
+
+// Add new model for escalation tracking
+public struct EscalationEntry: Identifiable, Sendable {
+    public let id: String
+    public let issueId: String
+    public let gate: String
+    public let reason: String
+    public let timestamp: Date
+
+    public init(issueId: String, gate: String, reason: String, timestamp: Date = Date()) {
+        self.id = "\(issueId)-\(timestamp.timeIntervalSince1970)"
+        self.issueId = issueId
+        self.gate = gate
+        self.reason = reason
+        self.timestamp = timestamp
+    }
+}
+```
+
+**Add ConnectionEventHandler conformance:**
+```swift
+extension AppState: ConnectionEventHandler {
+    @MainActor
+    func handleEvent(_ event: WebSocketEvent) {
+        switch event.type {
+        case .verdict:
+            handleVerdictEvent(event)
+        default:
+            break
+        }
+    }
+
+    private func handleVerdictEvent(_ event: WebSocketEvent) {
+        guard let payload = try? event.verdictPayload() else { return }
+        if payload.verdict.outcome == .escalate {
+            handleEscalation(verdict: payload.verdict)
+        }
+    }
+
+    private func handleEscalation(verdict: VerdictEntry) {
+        let entry = EscalationEntry(
+            issueId: verdict.issueId,
+            gate: verdict.gate,
+            reason: verdict.reason,
+            timestamp: verdict.timestamp
+        )
+        escalations.append(entry)
+        Task {
+            try? await notificationService?.showEscalationNotification(
+                issueId: verdict.issueId,
+                gate: verdict.gate,
+                reason: verdict.reason
+            )
+        }
+    }
+}
+```
+
+**Add NotificationResponseHandler conformance:**
+```swift
+extension AppState: NotificationResponseHandler {
+    @MainActor
+    func handleApprove(issueId: String) async {
+        do {
+            _ = try await apiClient?.approve(id: issueId)
+            escalations.removeAll { $0.issueId == issueId }
+        } catch {
+            lastError = "Approve failed: \(error.localizedDescription)"
+        }
+    }
+
+    @MainActor
+    func handleReject(issueId: String) async {
+        do {
+            _ = try await apiClient?.reject(id: issueId, reason: nil)
+            escalations.removeAll { $0.issueId == issueId }
+        } catch {
+            lastError = "Reject failed: \(error.localizedDescription)"
+        }
+    }
+
+    @MainActor
+    func handleViewIssue(issueId: String) {
+        selectedProjectId = issueId  // Used to navigate dashboard
+        isDashboardOpen = true
+        NotificationCenter.default.post(name: .openDashboard, object: nil)
+    }
+}
+```
+
+**Projected line count:** ~75 lines total (original 29 + ~46 new lines split across extensions)
+
+---
+
+### 5. AppDelegate.swift (MODIFY)
+
+**Current state:** 82 lines including C callback function.
+
+**Changes:**
+- Add `notificationDelegate` property
+- Initialize notification permissions in `applicationDidFinishLaunching`
+- Wire up NotificationDelegate to UNUserNotificationCenter
+
+```swift
+// Add after line 12 (after eventHandler property)
+
+    /// Notification delegate for handling user actions
+    private var notificationDelegate: NotificationDelegate?
+    private var notificationService: NotificationService?
+
+// Add to applicationDidFinishLaunching after line 18 (after setActivationPolicy)
+
+        // Set up notifications
+        setupNotifications()
+
+// Add new method after setupGlobalHotkey()
+
+    /// Set up notification service and request permission
+    private func setupNotifications() {
+        notificationService = NotificationService()
+        notificationService?.registerCategories()
+
+        notificationDelegate = NotificationDelegate()
+        UNUserNotificationCenter.current().delegate = notificationDelegate
+
+        // Request permission (non-blocking)
+        Task {
+            _ = try? await notificationService?.requestAuthorization()
+        }
+    }
+```
+
+**Projected line count:** ~95 lines (current 82 + 13 new lines)
+
+---
+
+### 6. Event.swift (MODIFY)
+
+**Current state:** 207 lines — mostly Codable boilerplate.
+
+**Changes:** Add `escalation` event type (1 line change).
+
+```swift
+// Modify line 14 to add escalation type
 public enum EventType: String, Codable, Sendable {
     case factoryUpdate = "factory_update"
     case verdict = "verdict"
     case heartbeat = "heartbeat"
     case pipelineUpdate = "pipeline_update"
     case agentStatus = "agent_status"
-}
-
-// Wrapper for all events
-public struct WebSocketEvent: Codable, Sendable, Identifiable {
-    public let id: UUID
-    public let type: EventType
-    public let timestamp: Date
-    public let payload: Data  // Raw JSON for type-specific decoding
-}
-
-// Type-specific payloads
-public struct FactoryUpdatePayload: Codable, Sendable {
-    public let factoryStatus: FactoryStatus
-    public let pipelines: [PipelineEntry]
-}
-
-public struct VerdictPayload: Codable, Sendable {
-    public let verdict: VerdictEntry
-}
-
-public struct HeartbeatPayload: Codable, Sendable {
-    public let agents: [AgentHeartbeat]
-    public let uptimeSeconds: Int
+    case escalation = "escalation"  // NEW: explicit escalation events
 }
 ```
 
-**Line estimate:** ~85 lines (models only, no logic)
-
-### 2. WebSocketService (`WebSocketService.swift`)
-
-**Purpose:** Manages URLSession WebSocket connection with reconnection logic.
-
-**Key Components:**
-
-```swift
-/// Connection state for WebSocket
-public enum WebSocketState: Sendable, Equatable {
-    case disconnected
-    case connecting
-    case connected
-    case reconnecting(attempt: Int)
-}
-
-/// Protocol for WebSocket service (enables mocking)
-public protocol WebSocketServiceProtocol: Sendable {
-    func connect() async throws
-    func disconnect() async
-    var events: AsyncStream<WebSocketEvent> { get }
-    var state: WebSocketState { get async }
-}
-
-/// URLSession-based WebSocket service with exponential backoff
-public actor WebSocketService: WebSocketServiceProtocol {
-    private let url: URL
-    private let session: URLSession
-    private var webSocketTask: URLSessionWebSocketTask?
-    private var reconnectAttempt: Int = 0
-    private let maxReconnectDelay: TimeInterval = 30.0
-    private let baseDelay: TimeInterval = 1.0
-
-    // Exponential backoff: 1s → 2s → 4s → 8s → 16s → 30s (capped)
-    private func reconnectDelay() -> TimeInterval
-
-    public func connect() async throws
-    public func disconnect() async
-    private func receiveMessages() async
-    private func scheduleReconnect() async
-}
-```
-
-**Guard/Recovery Pairs:**
-| Guard | Recovery |
-|-------|----------|
-| Connection fails | Schedule reconnect with exponential backoff |
-| Message decode error | Log warning, continue receiving |
-| Task cancelled | Clean disconnect, no reconnect |
-| Max retries reached | Notify delegate/callback of failure |
-
-**Line estimates per function:**
-- `reconnectDelay()`: 8 lines
-- `connect()`: 22 lines
-- `disconnect()`: 12 lines
-- `receiveMessages()`: 28 lines
-- `scheduleReconnect()`: 18 lines
-
-### 3. SSEService (`SSEService.swift`)
-
-**Purpose:** Server-Sent Events fallback when WebSocket unavailable.
-
-```swift
-/// SSE connection state
-public enum SSEState: Sendable, Equatable {
-    case disconnected
-    case connecting
-    case connected
-}
-
-/// Protocol for SSE service (enables mocking)
-public protocol SSEServiceProtocol: Sendable {
-    func connect() async throws
-    func disconnect() async
-    var events: AsyncStream<WebSocketEvent> { get }
-    var state: SSEState { get async }
-}
-
-/// URLSession-based SSE service
-public actor SSEService: SSEServiceProtocol {
-    private let url: URL
-    private let session: URLSession
-    private var dataTask: Task<Void, Never>?
-
-    public func connect() async throws
-    public func disconnect() async
-    private func parseSSELine(_ line: String) -> WebSocketEvent?
-    private func processStream(_ bytes: URLSession.AsyncBytes) async
-}
-```
-
-**Line estimates per function:**
-- `connect()`: 20 lines
-- `disconnect()`: 10 lines
-- `parseSSELine()`: 18 lines
-- `processStream()`: 25 lines
-
-### 4. ConnectionManager (`ConnectionManager.swift`)
-
-**Purpose:** Orchestrates connection strategy with fallback chain.
-
-```swift
-/// Overall connection status exposed to UI
-public enum ConnectionStatus: Sendable, Equatable {
-    case disconnected
-    case connecting(ConnectionMethod)
-    case connected(ConnectionMethod)
-    case reconnecting(ConnectionMethod, attempt: Int)
-    case failed(String)  // Error description
-}
-
-/// Connection method in use
-public enum ConnectionMethod: String, Sendable, CaseIterable {
-    case webSocket
-    case sse
-    case restPolling
-}
-
-/// Manages connection fallback chain: WebSocket → SSE → REST
-@MainActor
-public final class ConnectionManager: ObservableObject {
-    @Published public private(set) var status: ConnectionStatus = .disconnected
-
-    private let webSocketService: any WebSocketServiceProtocol
-    private let sseService: any SSEServiceProtocol
-    private let apiClient: any HeimdallAPIClientProtocol
-    private let pollingInterval: TimeInterval
-
-    private var activeTask: Task<Void, Never>?
-    private var webSocketRetries: Int = 0
-    private var sseRetries: Int = 0
-    private let maxRetries: Int = 3
-
-    public init(
-        webSocketService: any WebSocketServiceProtocol,
-        sseService: any SSEServiceProtocol,
-        apiClient: any HeimdallAPIClientProtocol,
-        pollingInterval: TimeInterval = 5.0
-    )
-
-    public func start() async
-    public func stop() async
-    private func tryWebSocket() async -> Bool
-    private func trySSE() async -> Bool
-    private func startPolling() async
-    private func handleEvent(_ event: WebSocketEvent)
-}
-```
-
-**Fallback Strategy:**
-1. Try WebSocket connection to `ws://host:7846/ws/events`
-2. If WebSocket fails 3 times → fallback to SSE at `/api/events`
-3. If SSE fails 3 times → fallback to REST polling
-4. REST polling continues indefinitely (uses existing HeimdallAPIClient)
-
-**Line estimates per function:**
-- `start()`: 28 lines
-- `stop()`: 12 lines
-- `tryWebSocket()`: 22 lines
-- `trySSE()`: 20 lines
-- `startPolling()`: 24 lines
-- `handleEvent()`: 15 lines
-
-### 5. AppState (`AppState.swift`)
-
-**Purpose:** Central observable state container for the entire app.
-
-```swift
-/// Central application state container
-@MainActor
-public final class AppState: ObservableObject {
-    // Connection status
-    @Published public var connectionStatus: ConnectionStatus = .disconnected
-
-    // Live data from real-time events
-    @Published public var pipelines: [PipelineEntry] = []
-    @Published public var verdicts: [VerdictEntry] = []
-    @Published public var agents: [AgentHeartbeat] = []
-    @Published public var factoryStatus: FactoryStatus = .stalled
-
-    // Services
-    private let connectionManager: ConnectionManager
-
-    public init(connectionManager: ConnectionManager)
-
-    public func start() async
-    public func stop() async
-
-    // Called by ConnectionManager when events arrive
-    internal func handleEvent(_ event: WebSocketEvent)
-}
-```
-
-**Line estimates per function:**
-- `init()`: 12 lines
-- `start()`: 18 lines
-- `stop()`: 10 lines
-- `handleEvent()`: 28 lines
+**Projected line count:** 208 lines (+1 line)
 
 ---
 
-## Data Path Trace
+### 7. ServiceTests.swift (MODIFY)
 
-### WebSocket Event Flow
+**Current state:** 350 lines.
 
-1. **WebSocketService.receiveMessages()** (line ~60)
-   - Calls `webSocketTask.receive()` in loop
-   - Decodes `WebSocketEvent` from JSON `.string` message
-   - Yields event to `AsyncStream<WebSocketEvent>`
+**Changes:** Add test suites for NotificationService, NotificationCategories, NotificationDelegate.
 
-2. **ConnectionManager.tryWebSocket()** (line ~45)
-   - Awaits `for await event in webSocketService.events`
-   - Calls `handleEvent(event)`
+```swift
+// MARK: - Mock Notification Service
 
-3. **ConnectionManager.handleEvent()** (line ~95)
-   - Forwards event to `AppState` via callback or direct reference
+final class MockNotificationService: NotificationServiceProtocol, @unchecked Sendable {
+    var authorizationRequested: Bool = false
+    var authorizationResult: Bool = true
+    var escalationNotifications: [(issueId: String, gate: String, reason: String)] = []
+    var verdictNotifications: [(issueId: String, outcome: String, reason: String)] = []
+    var errorNotifications: [(title: String, message: String)] = []
+    var categoriesRegistered: Bool = false
 
-4. **AppState.handleEvent()** (line ~55)
-   - Pattern matches on `event.type`
-   - Decodes type-specific payload from `event.payload`
-   - Updates appropriate `@Published` property
-   - SwiftUI views auto-refresh via Combine
+    func requestAuthorization() async throws -> Bool {
+        authorizationRequested = true
+        return authorizationResult
+    }
 
-### Fallback Chain Activation
+    func showEscalationNotification(issueId: String, gate: String, reason: String) async throws {
+        escalationNotifications.append((issueId, gate, reason))
+    }
 
-1. **ConnectionManager.start()** (line ~25)
-   - Calls `tryWebSocket()`
-   - On success: remains in WebSocket mode
-   - On failure: increments `webSocketRetries`
+    func showVerdictNotification(issueId: String, outcome: String, reason: String) async throws {
+        verdictNotifications.append((issueId, outcome, reason))
+    }
 
-2. **ConnectionManager.tryWebSocket()** (line ~45)
-   - Catches connection error after `maxRetries` (3)
-   - Updates `status = .connecting(.sse)`
-   - Calls `trySSE()`
+    func showErrorNotification(title: String, message: String) async throws {
+        errorNotifications.append((title, message))
+    }
 
-3. **ConnectionManager.trySSE()** (line ~70)
-   - Catches connection error after `maxRetries` (3)
-   - Updates `status = .connecting(.restPolling)`
-   - Calls `startPolling()`
+    func registerCategories() {
+        categoriesRegistered = true
+    }
+}
 
-4. **ConnectionManager.startPolling()** (line ~95)
-   - Uses existing `HeimdallAPIClient.fetchPipeline()`
-   - Polls every `pollingInterval` (5 seconds)
-   - Wraps REST response in `WebSocketEvent` format
-   - Continues indefinitely until `stop()` called
+// MARK: - Notification Category Tests
+
+@Suite("Notification Category Tests")
+struct NotificationCategoryTests {
+    @Test func escalationCategoryHasApproveRejectActions() async throws {
+        let category = NotificationCategories.escalationCategory()
+        #expect(category.identifier == "ESCALATION")
+        #expect(category.actions.count == 2)
+        let actionIds = category.actions.map { $0.identifier }
+        #expect(actionIds.contains("APPROVE_ACTION"))
+        #expect(actionIds.contains("REJECT_ACTION"))
+    }
+
+    @Test func verdictCategoryHasViewAction() async throws {
+        let category = NotificationCategories.verdictCategory()
+        #expect(category.identifier == "VERDICT")
+        #expect(category.actions.count == 1)
+        #expect(category.actions.first?.identifier == "VIEW_ACTION")
+    }
+
+    @Test func errorCategoryHasNoActions() async throws {
+        let category = NotificationCategories.errorCategory()
+        #expect(category.identifier == "ERROR")
+        #expect(category.actions.isEmpty)
+    }
+
+    @Test func allCategoriesReturnsThreeCategories() async throws {
+        let categories = NotificationCategories.allCategories()
+        #expect(categories.count == 3)
+    }
+}
+
+// MARK: - Mock Response Handler
+
+@MainActor
+final class MockResponseHandler: NotificationResponseHandler {
+    var approvedIds: [String] = []
+    var rejectedIds: [String] = []
+    var viewedIds: [String] = []
+
+    func handleApprove(issueId: String) async {
+        approvedIds.append(issueId)
+    }
+
+    func handleReject(issueId: String) async {
+        rejectedIds.append(issueId)
+    }
+
+    func handleViewIssue(issueId: String) {
+        viewedIds.append(issueId)
+    }
+}
+
+// MARK: - Notification Delegate Tests
+
+@Suite("Notification Delegate Tests")
+struct NotificationDelegateTests {
+    @Test @MainActor func delegateInitialization() async throws {
+        let delegate = NotificationDelegate()
+        #expect(delegate.responseHandler == nil)
+    }
+}
+
+// MARK: - AppState Escalation Tests
+
+@Suite("AppState Escalation Tests")
+struct AppStateEscalationTests {
+    @Test @MainActor func initialEscalationsEmpty() async throws {
+        let appState = AppState()
+        #expect(appState.escalations.isEmpty)
+    }
+
+    @Test @MainActor func escalationEntryIdGeneration() async throws {
+        let entry = EscalationEntry(
+            issueId: "AASF-123",
+            gate: "review",
+            reason: "Test reason"
+        )
+        #expect(entry.issueId == "AASF-123")
+        #expect(entry.gate == "review")
+        #expect(entry.id.hasPrefix("AASF-123-"))
+    }
+}
+```
+
+**Projected line count:** ~450 lines (current 350 + ~100 new test lines)
 
 ---
 
 ## Function Size Plan
 
-All functions planned to be under 50 lines. Detailed breakdown:
+| File | Function | Current Lines | Projected Lines | Helper Needed |
+|------|----------|---------------|-----------------|---------------|
+| AppState.swift | handleEvent | N/A (new) | 8 | No |
+| AppState.swift | handleVerdictEvent | N/A (new) | 5 | No |
+| AppState.swift | handleEscalation | N/A (new) | 14 | No |
+| AppState.swift | handleApprove | N/A (new) | 9 | No |
+| AppState.swift | handleReject | N/A (new) | 9 | No |
+| AppDelegate.swift | setupNotifications | N/A (new) | 13 | No |
+| NotificationDelegate.swift | userNotificationCenter(didReceive:) | N/A (new) | 12 | No |
+| NotificationDelegate.swift | handleAction | N/A (new) | 15 | No |
+| NotificationService.swift | showEscalationNotification | N/A (new) | 18 | No |
 
-| File | Function | Planned Lines | Notes |
-|------|----------|---------------|-------|
-| Event.swift | (models only) | N/A | No functions, just structs/enums |
-| WebSocketService.swift | `init()` | 8 | Simple property initialization |
-| WebSocketService.swift | `reconnectDelay()` | 8 | min(baseDelay * 2^attempt, maxDelay) |
-| WebSocketService.swift | `connect()` | 22 | Create task, setup continuation |
-| WebSocketService.swift | `disconnect()` | 12 | Cancel task, nil out references |
-| WebSocketService.swift | `receiveMessages()` | 28 | Receive loop with decode |
-| WebSocketService.swift | `scheduleReconnect()` | 18 | Delay + recursive connect |
-| SSEService.swift | `init()` | 6 | Simple initialization |
-| SSEService.swift | `connect()` | 20 | Setup bytes stream |
-| SSEService.swift | `disconnect()` | 10 | Cancel task |
-| SSEService.swift | `parseSSELine()` | 18 | Parse "data:" prefix, decode JSON |
-| SSEService.swift | `processStream()` | 25 | Read lines, yield events |
-| ConnectionManager.swift | `init()` | 10 | Store dependencies |
-| ConnectionManager.swift | `start()` | 28 | Orchestrate fallback chain |
-| ConnectionManager.swift | `stop()` | 12 | Cancel active task |
-| ConnectionManager.swift | `tryWebSocket()` | 22 | Connect + handle events |
-| ConnectionManager.swift | `trySSE()` | 20 | Connect + handle events |
-| ConnectionManager.swift | `startPolling()` | 24 | Polling loop |
-| ConnectionManager.swift | `handleEvent()` | 15 | Forward to AppState |
-| AppState.swift | `init()` | 12 | Setup bindings |
-| AppState.swift | `start()` | 18 | Start ConnectionManager |
-| AppState.swift | `stop()` | 10 | Stop ConnectionManager |
-| AppState.swift | `handleEvent()` | 28 | Switch on event type, update state |
-
-**All functions ≤ 28 lines — well under 50-line limit.**
+All functions remain under 50 lines.
 
 ---
 
 ## Test Strategy
 
-### File: `Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift`
+### Test Files
+- `Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift` (MODIFY)
 
-Replace placeholder test with comprehensive test suite:
+### Test Cases
 
-**WebSocket Tests:**
-```swift
-@Suite("WebSocket Service Tests")
-struct WebSocketServiceTests {
-    @Test func connectsToValidURL() async throws
-    @Test func yieldsEventsOnMessage() async throws
-    @Test func exponentialBackoffCalculation() async throws
-    @Test func maxReconnectDelayCapped() async throws
-    @Test func disconnectCancelsTask() async throws
-}
-```
+| Suite | Test | Verification |
+|-------|------|--------------|
+| NotificationCategoryTests | escalationCategoryHasApproveRejectActions | Category has ESCALATION id and 2 actions |
+| NotificationCategoryTests | verdictCategoryHasViewAction | Category has VERDICT id and VIEW_ACTION |
+| NotificationCategoryTests | errorCategoryHasNoActions | Category has ERROR id and no actions |
+| NotificationCategoryTests | allCategoriesReturnsThreeCategories | Set contains 3 categories |
+| NotificationDelegateTests | delegateInitialization | Delegate creates with nil handler |
+| AppStateEscalationTests | initialEscalationsEmpty | AppState.escalations starts empty |
+| AppStateEscalationTests | escalationEntryIdGeneration | Entry ID contains issueId prefix |
 
-**SSE Tests:**
-```swift
-@Suite("SSE Service Tests")
-struct SSEServiceTests {
-    @Test func parsesDataLine() async throws
-    @Test func ignoresCommentLines() async throws
-    @Test func handlesMultilineData() async throws
-}
-```
-
-**ConnectionManager Tests:**
-```swift
-@Suite("Connection Manager Tests")
-struct ConnectionManagerTests {
-    @Test func startsWithWebSocket() async throws
-    @Test func fallsBackToSSEAfterRetries() async throws
-    @Test func fallsBackToPollingAfterSSEFails() async throws
-    @Test func reportsCorrectStatus() async throws
-    @Test func stopCancelsActiveConnection() async throws
-}
-```
-
-**AppState Tests:**
-```swift
-@Suite("AppState Tests")
-struct AppStateTests {
-    @Test func updatesOnFactoryEvent() async throws
-    @Test func updatesOnVerdictEvent() async throws
-    @Test func exposesConnectionStatus() async throws
-}
-```
-
-### Mock Infrastructure
-
-Create mocks for testing:
-
-```swift
-// In ServiceTests.swift
-actor MockWebSocketService: WebSocketServiceProtocol {
-    var shouldFail: Bool = false
-    var eventsToYield: [WebSocketEvent] = []
-    private(set) var state: WebSocketState = .disconnected
-
-    var events: AsyncStream<WebSocketEvent> { ... }
-    func connect() async throws { ... }
-    func disconnect() async { ... }
-}
-
-actor MockSSEService: SSEServiceProtocol {
-    var shouldFail: Bool = false
-    var eventsToYield: [WebSocketEvent] = []
-    private(set) var state: SSEState = .disconnected
-
-    var events: AsyncStream<WebSocketEvent> { ... }
-    func connect() async throws { ... }
-    func disconnect() async { ... }
-}
+### Verification Command
+```bash
+swift test --filter HEIMDALLControlSurfaceTests
 ```
 
 ---
 
 ## Verification Plan
 
-| Acceptance Criterion | Test Method | Verification |
-|---------------------|-------------|--------------|
-| WebSocket connects to ws://host:7846/ws/events | `@Test connectsToValidURL` | Mock verifies URL passed |
-| Factory events update AppState | `@Test updatesOnFactoryEvent` | Check `@Published` property |
-| Automatic reconnection with exponential backoff | `@Test exponentialBackoffCalculation` | Verify delays: 1s→2s→4s→...→30s |
-| Graceful fallback to SSE | `@Test fallsBackToSSEAfterRetries` | Status changes after 3 WS failures |
-| Graceful fallback to REST | `@Test fallsBackToPollingAfterSSEFails` | Status changes after 3 SSE failures |
-| Connection status visible in AppState | `@Test exposesConnectionStatus` | Verify `connectionStatus` updates |
-| No memory leaks | Manual | Verify weak refs, task cancellation |
-
----
-
-## Risks & Mitigations
-
-| Risk | Mitigation |
-|------|------------|
-| URLSession WebSocket not available on older macOS | Target macOS 14+ (already in Package.swift) |
-| Memory leaks from uncancelled tasks | Use structured concurrency, cancel in `disconnect()` |
-| Race conditions in reconnect logic | Use actor isolation for WebSocketService/SSEService |
-| Event payload schema mismatch | Use optional fields with defaults, log decode warnings |
-| Connection manager state corruption | @MainActor isolation, single `activeTask` |
-
----
-
-## Commit Plan
-
-**Commit 1:** Event models (HCS-004)
-- `Sources/HEIMDALLControlSurface/Models/Event.swift`
-
-**Commit 2:** WebSocket service (HCS-004)
-- `Sources/HEIMDALLControlSurface/Services/WebSocketService.swift`
-
-**Commit 3:** SSE fallback (HCS-004)
-- `Sources/HEIMDALLControlSurface/Services/SSEService.swift`
-
-**Commit 4:** Connection manager + AppState (HCS-004)
-- `Sources/HEIMDALLControlSurface/Services/ConnectionManager.swift`
-- `Sources/HEIMDALLControlSurface/State/AppState.swift`
-
-**Commit 5:** Tests (HCS-004)
-- `Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift`
-
-Each commit ≤ 5 files per Rule 4.
+1. **Build succeeds:** `swift build` exits 0
+2. **Tests pass:** `swift test` exits 0
+3. **Category registration:** Verify `NotificationCategories.allCategories()` returns 3 categories
+4. **Escalation handling:** Mock verdict event with `.escalate` outcome triggers notification
+5. **Action routing:** NotificationDelegate routes approve/reject to handler
+6. **Dashboard opens:** View action posts `.openDashboard` notification
 
 ---
 
@@ -535,43 +737,49 @@ Each commit ≤ 5 files per Rule 4.
 
 ```json
 {
-  "issue_ref": "HCS-004",
+  "issue_ref": "HCS-006",
   "deliverables": [
+    {
+      "file": "Sources/HEIMDALLControlSurface/Services/NotificationCategory.swift",
+      "function": "",
+      "change_description": "CREATE: Notification categories with escalation/verdict/error identifiers and action buttons",
+      "verification": "swift build succeeds; NotificationCategories.allCategories() returns 3 categories"
+    },
+    {
+      "file": "Sources/HEIMDALLControlSurface/Services/NotificationService.swift",
+      "function": "",
+      "change_description": "CREATE: UNUserNotificationCenter wrapper with requestAuthorization(), showEscalationNotification(), showVerdictNotification(), showErrorNotification()",
+      "verification": "swift build succeeds; MockNotificationService can substitute in tests"
+    },
+    {
+      "file": "Sources/HEIMDALLControlSurface/Services/NotificationDelegate.swift",
+      "function": "",
+      "change_description": "CREATE: UNUserNotificationCenterDelegate with handleAction() routing to NotificationResponseHandler",
+      "verification": "swift build succeeds; delegate routes actions to handler"
+    },
+    {
+      "file": "Sources/HEIMDALLControlSurface/AppState.swift",
+      "function": "handleEvent, handleEscalation, handleApprove, handleReject, handleViewIssue",
+      "change_description": "MODIFY: Add escalations array, conform to ConnectionEventHandler and NotificationResponseHandler protocols",
+      "verification": "swift test AppStateEscalationTests pass"
+    },
+    {
+      "file": "Sources/HEIMDALLControlSurface/AppDelegate.swift",
+      "function": "setupNotifications",
+      "change_description": "MODIFY: Add setupNotifications() to applicationDidFinishLaunching, initialize NotificationService and delegate",
+      "verification": "swift build succeeds; notification permission requested on launch"
+    },
     {
       "file": "Sources/HEIMDALLControlSurface/Models/Event.swift",
       "function": "",
-      "change_description": "CREATE: WebSocket event models (EventType enum, WebSocketEvent struct, FactoryUpdatePayload, VerdictPayload, HeartbeatPayload)",
-      "verification": "swift build compiles without errors"
-    },
-    {
-      "file": "Sources/HEIMDALLControlSurface/Services/WebSocketService.swift",
-      "function": "WebSocketService (actor)",
-      "change_description": "CREATE: Actor-based WebSocket service with connect(), disconnect(), receiveMessages(), exponential backoff reconnection (1s→30s cap)",
-      "verification": "@Test connectsToValidURL, @Test exponentialBackoffCalculation, @Test maxReconnectDelayCapped"
-    },
-    {
-      "file": "Sources/HEIMDALLControlSurface/Services/SSEService.swift",
-      "function": "SSEService (actor)",
-      "change_description": "CREATE: Actor-based SSE fallback service with connect(), disconnect(), parseSSELine(), processStream()",
-      "verification": "@Test parsesDataLine, @Test ignoresCommentLines"
-    },
-    {
-      "file": "Sources/HEIMDALLControlSurface/Services/ConnectionManager.swift",
-      "function": "ConnectionManager (@MainActor class)",
-      "change_description": "CREATE: ObservableObject that orchestrates WebSocket → SSE → REST fallback with ConnectionStatus enum, maxRetries=3",
-      "verification": "@Test fallsBackToSSEAfterRetries, @Test fallsBackToPollingAfterSSEFails, @Test reportsCorrectStatus"
-    },
-    {
-      "file": "Sources/HEIMDALLControlSurface/State/AppState.swift",
-      "function": "AppState (@MainActor class)",
-      "change_description": "CREATE: Central ObservableObject with @Published properties for pipelines, verdicts, agents, factoryStatus, connectionStatus. handleEvent() dispatches by type.",
-      "verification": "@Test updatesOnFactoryEvent, @Test updatesOnVerdictEvent, @Test exposesConnectionStatus"
+      "change_description": "MODIFY: Add .escalation case to EventType enum",
+      "verification": "EventType.escalation.rawValue == \"escalation\""
     },
     {
       "file": "Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift",
       "function": "",
-      "change_description": "MODIFY: Replace placeholder with WebSocketServiceTests, SSEServiceTests, ConnectionManagerTests, AppStateTests suites. Add MockWebSocketService, MockSSEService.",
-      "verification": "swift test passes all new tests"
+      "change_description": "MODIFY: Add MockNotificationService, NotificationCategoryTests, NotificationDelegateTests, AppStateEscalationTests suites",
+      "verification": "swift test --filter HEIMDALLControlSurfaceTests passes all tests"
     }
   ]
 }

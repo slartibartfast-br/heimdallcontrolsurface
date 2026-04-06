@@ -346,4 +346,138 @@ struct EventModelTests {
         #expect(methods.contains(.sse))
         #expect(methods.contains(.restPolling))
     }
+
+    @Test func escalationEventType() async throws {
+        #expect(EventType.escalation.rawValue == "escalation")
+    }
+}
+
+// MARK: - Mock Notification Service (HCS-006)
+
+final class MockNotificationService: NotificationServiceProtocol, @unchecked Sendable {
+    var authorizationRequested: Bool = false
+    var authorizationResult: Bool = true
+    var escalationNotifications: [(issueId: String, gate: String, reason: String)] = []
+    var verdictNotifications: [(issueId: String, outcome: String, reason: String)] = []
+    var errorNotifications: [(title: String, message: String)] = []
+    var categoriesRegistered: Bool = false
+
+    func requestAuthorization() async throws -> Bool {
+        authorizationRequested = true
+        return authorizationResult
+    }
+
+    func showEscalationNotification(issueId: String, gate: String, reason: String) async throws {
+        escalationNotifications.append((issueId, gate, reason))
+    }
+
+    func showVerdictNotification(issueId: String, outcome: String, reason: String) async throws {
+        verdictNotifications.append((issueId, outcome, reason))
+    }
+
+    func showErrorNotification(title: String, message: String) async throws {
+        errorNotifications.append((title, message))
+    }
+
+    func registerCategories() {
+        categoriesRegistered = true
+    }
+}
+
+// MARK: - Notification Category Tests (HCS-006)
+
+@Suite("Notification Category Tests")
+struct NotificationCategoryTests {
+    @Test func escalationCategoryHasApproveRejectActions() async throws {
+        let category = NotificationCategories.escalationCategory()
+        #expect(category.identifier == "ESCALATION")
+        #expect(category.actions.count == 2)
+        let actionIds = category.actions.map { $0.identifier }
+        #expect(actionIds.contains("APPROVE_ACTION"))
+        #expect(actionIds.contains("REJECT_ACTION"))
+    }
+
+    @Test func verdictCategoryHasViewAction() async throws {
+        let category = NotificationCategories.verdictCategory()
+        #expect(category.identifier == "VERDICT")
+        #expect(category.actions.count == 1)
+        #expect(category.actions.first?.identifier == "VIEW_ACTION")
+    }
+
+    @Test func errorCategoryHasNoActions() async throws {
+        let category = NotificationCategories.errorCategory()
+        #expect(category.identifier == "ERROR")
+        #expect(category.actions.isEmpty)
+    }
+
+    @Test func allCategoriesReturnsThreeCategories() async throws {
+        let categories = NotificationCategories.allCategories()
+        #expect(categories.count == 3)
+    }
+}
+
+// MARK: - Mock Response Handler (HCS-006)
+
+@MainActor
+final class MockResponseHandler: NotificationResponseHandler {
+    var approvedIds: [String] = []
+    var rejectedIds: [String] = []
+    var viewedIds: [String] = []
+
+    func handleApprove(issueId: String) async {
+        approvedIds.append(issueId)
+    }
+
+    func handleReject(issueId: String) async {
+        rejectedIds.append(issueId)
+    }
+
+    func handleViewIssue(issueId: String) {
+        viewedIds.append(issueId)
+    }
+}
+
+// MARK: - Notification Delegate Tests (HCS-006)
+
+@Suite("Notification Delegate Tests")
+struct NotificationDelegateTests {
+    @Test @MainActor func delegateInitialization() async throws {
+        let delegate = NotificationDelegate()
+        #expect(delegate.responseHandler == nil)
+    }
+}
+
+// MARK: - AppState Escalation Tests (HCS-006)
+
+@Suite("AppState Escalation Tests")
+struct AppStateEscalationTests {
+    @Test @MainActor func initialEscalationsEmpty() async throws {
+        let appState = AppState()
+        #expect(appState.escalations.isEmpty)
+    }
+
+    @Test @MainActor func escalationEntryIdGeneration() async throws {
+        let entry = EscalationEntry(
+            issueId: "AASF-123",
+            gate: "review",
+            reason: "Test reason"
+        )
+        #expect(entry.issueId == "AASF-123")
+        #expect(entry.gate == "review")
+        #expect(entry.id.hasPrefix("AASF-123-"))
+    }
+
+    @Test @MainActor func escalationEntryProperties() async throws {
+        let timestamp = Date()
+        let entry = EscalationEntry(
+            issueId: "HCS-001",
+            gate: "implement",
+            reason: "Needs human approval",
+            timestamp: timestamp
+        )
+        #expect(entry.issueId == "HCS-001")
+        #expect(entry.gate == "implement")
+        #expect(entry.reason == "Needs human approval")
+        #expect(entry.timestamp == timestamp)
+    }
 }
