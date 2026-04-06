@@ -39,6 +39,12 @@ final class AppState: @unchecked Sendable {
     // Pending escalations requiring user action (HCS-006)
     var escalations: [EscalationEntry] = []
 
+    // Pending approvals queue (HCS-005)
+    var pendingApprovals: [Approval] = []
+
+    // Pending actions with undo window (HCS-005)
+    var pendingActions: [ApprovalAction] = []
+
     // Notification service (injected, HCS-006)
     private var notificationService: (any NotificationServiceProtocol)?
     private var apiClient: (any HeimdallAPIClientProtocol)?
@@ -60,6 +66,65 @@ final class AppState: @unchecked Sendable {
     ) {
         self.notificationService = notificationService
         self.apiClient = apiClient
+    }
+
+    // MARK: - Pending Approvals (HCS-005)
+
+    /// Refresh pending approvals from API
+    func refreshPendingApprovals() async throws {
+        guard let apiClient else { return }
+        let response = try await apiClient.fetchPendingApprovals()
+        pendingApprovals = response.approvals
+    }
+
+    /// Queue an approval action with undo window
+    func queueApprovalAction(approval: Approval, actionType: ApprovalActionType) {
+        // Remove from pending list immediately (optimistic UI)
+        pendingApprovals.removeAll { $0.id == approval.id }
+
+        // Create action with undo window
+        let action = ApprovalAction(approval: approval, actionType: actionType)
+        pendingActions.append(action)
+
+        // Schedule execution after undo window
+        scheduleActionExecution(action)
+    }
+
+    /// Cancel a pending action (undo)
+    func cancelPendingAction(_ action: ApprovalAction) {
+        action.cancel()
+        pendingActions.removeAll { $0.id == action.id }
+        // Restore to pending list
+        pendingApprovals.append(action.approval)
+    }
+
+    /// Schedule action execution after undo window expires
+    private func scheduleActionExecution(_ action: ApprovalAction) {
+        Task {
+            try? await Task.sleep(for: .seconds(ApprovalAction.undoWindowSeconds))
+            await executeActionIfNotCancelled(action)
+        }
+    }
+
+    /// Execute action if not cancelled
+    private func executeActionIfNotCancelled(_ action: ApprovalAction) async {
+        guard !action.isCancelled, let apiClient else {
+            cleanupAction(action)
+            return
+        }
+
+        do {
+            try await action.execute(using: apiClient)
+        } catch {
+            lastError = "Action failed: \(error.localizedDescription)"
+        }
+
+        cleanupAction(action)
+    }
+
+    /// Remove action from pending list
+    private func cleanupAction(_ action: ApprovalAction) {
+        pendingActions.removeAll { $0.id == action.id }
     }
 }
 

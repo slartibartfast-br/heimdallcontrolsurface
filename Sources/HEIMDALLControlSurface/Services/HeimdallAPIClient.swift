@@ -37,6 +37,8 @@ public protocol HeimdallAPIClientProtocol: Sendable {
     func fetchDecisions(limit: Int, project: String?) async throws -> DecisionsResponse
     func approve(id: String) async throws -> ApprovalResult
     func reject(id: String, reason: String?) async throws -> ApprovalResult
+    func hold(id: String) async throws -> ApprovalResult  // HCS-005
+    func fetchPendingApprovals() async throws -> PendingApprovalsResponse  // HCS-005
 }
 
 /// URLSession-based HTTP client for HEIMDALL monitor API
@@ -117,6 +119,18 @@ public final class HeimdallAPIClient: HeimdallAPIClientProtocol, @unchecked Send
         struct RejectBody: Encodable { let reason: String }
         let body = reason.map { RejectBody(reason: $0) }
         return try await post("/api/v1/reject/\(id)", body: body)
+    }
+
+    // MARK: - Hold Action (HCS-005)
+
+    public func hold(id: String) async throws -> ApprovalResult {
+        try await post("/api/v1/hold/\(id)", body: nil as String?)
+    }
+
+    // MARK: - Pending Approvals (HCS-005)
+
+    public func fetchPendingApprovals() async throws -> PendingApprovalsResponse {
+        try await get("/api/v1/pending-approvals")
     }
 
     // MARK: - Private Helpers
