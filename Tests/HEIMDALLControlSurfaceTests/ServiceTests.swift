@@ -1,10 +1,406 @@
+// Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift
+// HCS-004: WebSocket, SSE, ConnectionManager, and AppState tests
+
 import Testing
+import Foundation
 @testable import HEIMDALLControlSurface
 
-@Suite("Service Tests")
-struct ServiceTests {
-    @Test func placeholder() async throws {
-        // Placeholder test - to be implemented with services
-        #expect(true)
+// MARK: - Mock WebSocket Service
+
+actor MockWebSocketService: WebSocketServiceProtocol {
+    var shouldFail: Bool = false
+    var eventsToYield: [WebSocketEvent] = []
+    var connectCalled: Bool = false
+    var disconnectCalled: Bool = false
+
+    private var _state: WebSocketState = .disconnected
+    var state: WebSocketState { _state }
+
+    private var eventContinuation: AsyncStream<WebSocketEvent>.Continuation?
+    let events: AsyncStream<WebSocketEvent>
+
+    init() {
+        var continuation: AsyncStream<WebSocketEvent>.Continuation?
+        self.events = AsyncStream { continuation = $0 }
+        self.eventContinuation = continuation
+    }
+
+    func connect() async throws {
+        connectCalled = true
+        if shouldFail {
+            throw SSEError.connectionFailed
+        }
+        _state = .connected
+        for event in eventsToYield {
+            eventContinuation?.yield(event)
+        }
+    }
+
+    func disconnect() async {
+        disconnectCalled = true
+        _state = .disconnected
+        eventContinuation?.finish()
+    }
+
+    func setShouldFail(_ fail: Bool) { shouldFail = fail }
+    func setEventsToYield(_ events: [WebSocketEvent]) { eventsToYield = events }
+    func yieldEvent(_ event: WebSocketEvent) { eventContinuation?.yield(event) }
+    func finishEvents() { eventContinuation?.finish() }
+}
+
+// MARK: - Mock SSE Service
+
+actor MockSSEService: SSEServiceProtocol {
+    var shouldFail: Bool = false
+    var eventsToYield: [WebSocketEvent] = []
+    var connectCalled: Bool = false
+    var disconnectCalled: Bool = false
+
+    private var _state: SSEState = .disconnected
+    var state: SSEState { _state }
+
+    private var eventContinuation: AsyncStream<WebSocketEvent>.Continuation?
+    let events: AsyncStream<WebSocketEvent>
+
+    init() {
+        var continuation: AsyncStream<WebSocketEvent>.Continuation?
+        self.events = AsyncStream { continuation = $0 }
+        self.eventContinuation = continuation
+    }
+
+    func connect() async throws {
+        connectCalled = true
+        if shouldFail {
+            throw SSEError.connectionFailed
+        }
+        _state = .connected
+        for event in eventsToYield {
+            eventContinuation?.yield(event)
+        }
+    }
+
+    func disconnect() async {
+        disconnectCalled = true
+        _state = .disconnected
+        eventContinuation?.finish()
+    }
+
+    func setShouldFail(_ fail: Bool) { shouldFail = fail }
+    func setEventsToYield(_ events: [WebSocketEvent]) { eventsToYield = events }
+    func yieldEvent(_ event: WebSocketEvent) { eventContinuation?.yield(event) }
+    func finishEvents() { eventContinuation?.finish() }
+}
+
+// MARK: - Mock API Client
+
+final class MockAPIClient: HeimdallAPIClientProtocol, @unchecked Sendable {
+    var pipelineResponse: PipelineResponse?
+    var fetchPipelineCalled: Bool = false
+
+    func fetchPipeline() async throws -> PipelineResponse {
+        fetchPipelineCalled = true
+        if let response = pipelineResponse {
+            return response
+        }
+        return PipelineResponse(pipelines: [], factoryStatus: .healthy, timestamp: Date())
+    }
+
+    func fetchVerdicts(limit: Int) async throws -> [VerdictEntry] { [] }
+    func fetchHeartbeat() async throws -> HeartbeatResponse {
+        HeartbeatResponse(agents: [], uptimeSeconds: 0)
+    }
+    func fetchTelemetry() async throws -> KPIResponse {
+        KPIResponse(kpis: [], timestamp: Date().timeIntervalSince1970, uptimeSeconds: 0)
+    }
+    func fetchInfraHealth() async throws -> InfraResponse {
+        InfraResponse(services: [], timestamp: Date().timeIntervalSince1970)
+    }
+    func fetchProjects() async throws -> SwitcherResponse {
+        SwitcherResponse(projects: [], selectedProject: "", timestamp: Date().timeIntervalSince1970)
+    }
+    func fetchAgents() async throws -> AgentsResponse {
+        AgentsResponse(agents: [], count: 0, timestamp: 0)
+    }
+    func fetchDecisions(limit: Int, project: String?) async throws -> DecisionsResponse {
+        DecisionsResponse(decisions: [], count: 0, timestamp: Date().timeIntervalSince1970)
+    }
+    func approve(id: String) async throws -> ApprovalResult {
+        ApprovalResult(ok: true)
+    }
+    func reject(id: String, reason: String?) async throws -> ApprovalResult {
+        ApprovalResult(ok: true)
+    }
+}
+
+// MARK: - WebSocket Service Tests
+
+@Suite("WebSocket Service Tests")
+struct WebSocketServiceTests {
+    @Test func exponentialBackoffCalculation() async throws {
+        let url = URL(string: "ws://localhost:7846/ws/events")!
+        let service = WebSocketService(url: url)
+        // First attempt: 1s
+        let delay0 = await service.reconnectDelay()
+        #expect(delay0 == 1.0)
+    }
+
+    @Test func maxReconnectDelayCapped() async throws {
+        let url = URL(string: "ws://localhost:7846/ws/events")!
+        let service = WebSocketService(url: url)
+        // The max delay should be 30 seconds as per implementation
+        let delay = await service.reconnectDelay()
+        #expect(delay <= 30.0)
+    }
+
+    @Test func stateTransitions() async throws {
+        let url = URL(string: "ws://localhost:7846/ws/events")!
+        let service = WebSocketService(url: url)
+        let initialState = await service.state
+        #expect(initialState == .disconnected)
+    }
+}
+
+// MARK: - SSE Service Tests
+
+@Suite("SSE Service Tests")
+struct SSEServiceTests {
+    @Test func initialStateIsDisconnected() async throws {
+        let url = URL(string: "http://localhost:7846/api/events")!
+        let service = SSEService(url: url)
+        let state = await service.state
+        #expect(state == .disconnected)
+    }
+
+    @Test func disconnectSetsStateToDisconnected() async throws {
+        let url = URL(string: "http://localhost:7846/api/events")!
+        let service = SSEService(url: url)
+        await service.disconnect()
+        let state = await service.state
+        #expect(state == .disconnected)
+    }
+}
+
+// MARK: - Connection Manager Tests
+
+@Suite("Connection Manager Tests")
+struct ConnectionManagerTests {
+    @Test @MainActor func startsWithWebSocket() async throws {
+        let mockWS = MockWebSocketService()
+        let mockSSE = MockSSEService()
+        let mockAPI = MockAPIClient()
+        let manager = ConnectionManager(
+            webSocketService: mockWS,
+            sseService: mockSSE,
+            apiClient: mockAPI
+        )
+        await manager.start()
+        // Give time for connection attempt
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let connectCalled = await mockWS.connectCalled
+        #expect(connectCalled == true)
+        await manager.stop()
+    }
+
+    @Test @MainActor func fallsBackToSSEAfterRetries() async throws {
+        let mockWS = MockWebSocketService()
+        await mockWS.setShouldFail(true)
+        let mockSSE = MockSSEService()
+        let mockAPI = MockAPIClient()
+        let manager = ConnectionManager(
+            webSocketService: mockWS,
+            sseService: mockSSE,
+            apiClient: mockAPI
+        )
+        await manager.start()
+        // Wait for WebSocket retries and SSE fallback
+        try await Task.sleep(nanoseconds: 2_000_000_000)
+        let sseConnectCalled = await mockSSE.connectCalled
+        #expect(sseConnectCalled == true)
+        await manager.stop()
+    }
+
+    @Test @MainActor func fallsBackToPollingAfterSSEFails() async throws {
+        let mockWS = MockWebSocketService()
+        await mockWS.setShouldFail(true)
+        let mockSSE = MockSSEService()
+        await mockSSE.setShouldFail(true)
+        let mockAPI = MockAPIClient()
+        let manager = ConnectionManager(
+            webSocketService: mockWS,
+            sseService: mockSSE,
+            apiClient: mockAPI
+        )
+        await manager.start()
+        // Wait for both WebSocket and SSE retries
+        try await Task.sleep(nanoseconds: 4_000_000_000)
+        #expect(mockAPI.fetchPipelineCalled == true)
+        await manager.stop()
+    }
+
+    @Test @MainActor func reportsCorrectStatus() async throws {
+        let mockWS = MockWebSocketService()
+        let mockSSE = MockSSEService()
+        let mockAPI = MockAPIClient()
+        let manager = ConnectionManager(
+            webSocketService: mockWS,
+            sseService: mockSSE,
+            apiClient: mockAPI
+        )
+        #expect(manager.status == .disconnected)
+    }
+
+    @Test @MainActor func stopCancelsActiveConnection() async throws {
+        let mockWS = MockWebSocketService()
+        let mockSSE = MockSSEService()
+        let mockAPI = MockAPIClient()
+        let manager = ConnectionManager(
+            webSocketService: mockWS,
+            sseService: mockSSE,
+            apiClient: mockAPI
+        )
+        await manager.start()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        await manager.stop()
+        #expect(manager.status == .disconnected)
+    }
+}
+
+// MARK: - AppState Tests
+
+@Suite("AppState Tests")
+struct AppStateTests {
+    @Test @MainActor func updatesOnFactoryEvent() async throws {
+        let mockWS = MockWebSocketService()
+        let mockSSE = MockSSEService()
+        let mockAPI = MockAPIClient()
+        let manager = ConnectionManager(
+            webSocketService: mockWS,
+            sseService: mockSSE,
+            apiClient: mockAPI
+        )
+        let appState = AppState(connectionManager: manager)
+        // Create factory update event
+        let pipeline = PipelineEntry(
+            issueId: "TEST-1",
+            phase: "implement",
+            agent: "test-agent",
+            status: .running,
+            startedAt: Date(),
+            lastHeartbeat: Date()
+        )
+        let payload = FactoryUpdatePayload(factoryStatus: .healthy, pipelines: [pipeline])
+        let payloadData = try JSONEncoder().encode(payload)
+        let event = WebSocketEvent(type: .factoryUpdate, payload: payloadData)
+        appState.handleEvent(event)
+        #expect(appState.factoryStatus == .healthy)
+        #expect(appState.pipelines.count == 1)
+        #expect(appState.pipelines.first?.issueId == "TEST-1")
+    }
+
+    @Test @MainActor func updatesOnVerdictEvent() async throws {
+        let mockWS = MockWebSocketService()
+        let mockSSE = MockSSEService()
+        let mockAPI = MockAPIClient()
+        let manager = ConnectionManager(
+            webSocketService: mockWS,
+            sseService: mockSSE,
+            apiClient: mockAPI
+        )
+        let appState = AppState(connectionManager: manager)
+        // Create verdict event
+        let verdict = VerdictEntry(
+            timestamp: Date(),
+            issueId: "TEST-2",
+            gate: "implement",
+            outcome: .pass,
+            reason: "All tests pass",
+            agent: "test-agent"
+        )
+        let payload = VerdictPayload(verdict: verdict)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let payloadData = try encoder.encode(payload)
+        let event = WebSocketEvent(type: .verdict, payload: payloadData)
+        appState.handleEvent(event)
+        #expect(appState.verdicts.count == 1)
+        #expect(appState.verdicts.first?.issueId == "TEST-2")
+    }
+
+    @Test @MainActor func exposesConnectionStatus() async throws {
+        let mockWS = MockWebSocketService()
+        let mockSSE = MockSSEService()
+        let mockAPI = MockAPIClient()
+        let manager = ConnectionManager(
+            webSocketService: mockWS,
+            sseService: mockSSE,
+            apiClient: mockAPI
+        )
+        let appState = AppState(connectionManager: manager)
+        #expect(appState.connectionStatus == .disconnected)
+    }
+
+    @Test @MainActor func handlesHeartbeatEvent() async throws {
+        let mockWS = MockWebSocketService()
+        let mockSSE = MockSSEService()
+        let mockAPI = MockAPIClient()
+        let manager = ConnectionManager(
+            webSocketService: mockWS,
+            sseService: mockSSE,
+            apiClient: mockAPI
+        )
+        let appState = AppState(connectionManager: manager)
+        // Create heartbeat event
+        let agent = AgentHeartbeat(
+            name: "agent-1",
+            lastSeen: Date(),
+            status: .active
+        )
+        let payload = HeartbeatPayload(agents: [agent], uptimeSeconds: 3600)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let payloadData = try encoder.encode(payload)
+        let event = WebSocketEvent(type: .heartbeat, payload: payloadData)
+        appState.handleEvent(event)
+        #expect(appState.agents.count == 1)
+        #expect(appState.agents.first?.name == "agent-1")
+    }
+}
+
+// MARK: - Event Model Tests
+
+@Suite("Event Model Tests")
+struct EventModelTests {
+    @Test func eventTypeRawValues() async throws {
+        #expect(EventType.factoryUpdate.rawValue == "factory_update")
+        #expect(EventType.verdict.rawValue == "verdict")
+        #expect(EventType.heartbeat.rawValue == "heartbeat")
+        #expect(EventType.pipelineUpdate.rawValue == "pipeline_update")
+        #expect(EventType.agentStatus.rawValue == "agent_status")
+    }
+
+    @Test func webSocketEventCreation() async throws {
+        let event = WebSocketEvent(
+            type: .heartbeat,
+            timestamp: Date(),
+            payload: Data()
+        )
+        #expect(event.type == .heartbeat)
+    }
+
+    @Test func connectionStatusEquality() async throws {
+        let status1 = ConnectionStatus.disconnected
+        let status2 = ConnectionStatus.disconnected
+        #expect(status1 == status2)
+        let status3 = ConnectionStatus.connected(.webSocket)
+        let status4 = ConnectionStatus.connected(.sse)
+        #expect(status3 != status4)
+    }
+
+    @Test func connectionMethodCases() async throws {
+        let methods = ConnectionMethod.allCases
+        #expect(methods.count == 3)
+        #expect(methods.contains(.webSocket))
+        #expect(methods.contains(.sse))
+        #expect(methods.contains(.restPolling))
     }
 }
