@@ -1,6 +1,7 @@
 // Sources/HEIMDALLControlSurface/HeimdallApp.swift
 // HCS-002: Main app entry point
 // HCS-006: Wire notification services to AppState
+// HCS-008: Wire hotkey service to AppState
 
 import SwiftUI
 
@@ -18,7 +19,10 @@ struct HEIMDALLControlSurfaceApp: App {
         MenuBarExtra("HEIMDALL", systemImage: "circle.hexagongrid.fill") {
             MenuBarView()
                 .environment(appState)
-                .onAppear { wireNotifications() }
+                .onAppear {
+                    wireNotifications()
+                    wireHotkeys()
+                }
         }
         .menuBarExtraStyle(.window)
 
@@ -42,5 +46,25 @@ struct HEIMDALLControlSurfaceApp: App {
         let baseURL = URL(string: "http://localhost:7846")!
         let apiClient = HeimdallAPIClient(baseURL: baseURL)
         appState.configure(notificationService: notificationService, apiClient: apiClient)
+    }
+
+    /// Wire hotkey service to AppState (HCS-008)
+    private func wireHotkeys() {
+        let hotkeyService = appDelegate.initializeHotkeyService()
+        hotkeyService.registerHotkeys { [weak appState] hotkeyId in
+            guard let appState = appState else { return }
+            switch hotkeyId {
+            case 1:  // Toggle Dashboard (ctrl+opt+cmd+H)
+                appState.toggleDashboard()
+                NotificationCenter.default.post(name: .openDashboard, object: nil)
+                NSApp.activate(ignoringOtherApps: true)
+            case 2:  // Approve Next (ctrl+opt+cmd+A)
+                appState.approveNext()
+            case 3:  // Reject Next (ctrl+opt+cmd+R)
+                appState.rejectNext()
+            default:
+                break
+            }
+        }
     }
 }

@@ -59,6 +59,22 @@ final class AppState: @unchecked Sendable {
         lastError = nil
     }
 
+    /// Approve the next pending escalation (for global hotkey, HCS-008)
+    func approveNext() {
+        guard let next = escalations.first else { return }
+        Task {
+            await handleApprove(issueId: next.issueId)
+        }
+    }
+
+    /// Reject the next pending escalation (for global hotkey, HCS-008)
+    func rejectNext() {
+        guard let next = escalations.first else { return }
+        Task {
+            await handleReject(issueId: next.issueId)
+        }
+    }
+
     /// Configure services (called from AppDelegate, HCS-006)
     func configure(
         notificationService: any NotificationServiceProtocol,
