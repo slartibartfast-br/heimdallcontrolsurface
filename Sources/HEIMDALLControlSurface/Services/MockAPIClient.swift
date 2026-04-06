@@ -96,6 +96,24 @@ public final class MockHeimdallAPIClient: HeimdallAPIClientProtocol, @unchecked 
         return ApprovalResult(ok: true, message: "Rejected", error: nil)
     }
 
+    // MARK: - HCS-005: Hold Action
+
+    public func hold(id: String) async throws -> ApprovalResult {
+        try await simulateNetwork()
+        return ApprovalResult(ok: true, message: "Held", error: nil)
+    }
+
+    // MARK: - HCS-005: Pending Approvals
+
+    public func fetchPendingApprovals() async throws -> PendingApprovalsResponse {
+        try await simulateNetwork()
+        return PendingApprovalsResponse(
+            approvals: [MockData.pendingApproval],
+            count: 1,
+            timestamp: Date().timeIntervalSince1970
+        )
+    }
+
     // MARK: - Private
 
     private func simulateNetwork() async throws {
@@ -184,5 +202,15 @@ public enum MockData {
         decision: "approve",
         rationale: "Plan meets all criteria",
         ts: ISO8601DateFormatter().string(from: Date())
+    )
+
+    // HCS-005: Mock pending approval
+    public static let pendingApproval = Approval(
+        id: "approval-1",
+        issueId: "AASF-100",
+        phase: "plan",
+        reason: "Plan requires human review before proceeding to implement phase",
+        agent: "odin",
+        timestamp: Date()
     )
 }
