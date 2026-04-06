@@ -265,104 +265,47 @@ struct ConnectionManagerTests {
     }
 }
 
-// MARK: - AppState Tests
+// MARK: - AppState Tests (HCS-002)
 
 @Suite("AppState Tests")
 struct AppStateTests {
-    @Test @MainActor func updatesOnFactoryEvent() async throws {
-        let mockWS = MockWebSocketService()
-        let mockSSE = MockSSEService()
-        let mockAPI = MockAPIClient()
-        let manager = ConnectionManager(
-            webSocketService: mockWS,
-            sseService: mockSSE,
-            apiClient: mockAPI
-        )
-        let appState = AppState(connectionManager: manager)
-        // Create factory update event
-        let pipeline = PipelineEntry(
-            issueId: "TEST-1",
-            phase: "implement",
-            agent: "test-agent",
-            status: .running,
-            startedAt: Date(),
-            lastHeartbeat: Date()
-        )
-        let payload = FactoryUpdatePayload(factoryStatus: .healthy, pipelines: [pipeline])
-        let payloadData = try JSONEncoder().encode(payload)
-        let event = WebSocketEvent(type: .factoryUpdate, payload: payloadData)
-        appState.handleEvent(event)
-        #expect(appState.factoryStatus == .healthy)
-        #expect(appState.pipelines.count == 1)
-        #expect(appState.pipelines.first?.issueId == "TEST-1")
+    @Test @MainActor func initialStateValues() async throws {
+        let appState = AppState()
+        #expect(appState.isDashboardOpen == false)
+        #expect(appState.isConnected == false)
+        #expect(appState.selectedProjectId == nil)
+        #expect(appState.lastError == nil)
     }
 
-    @Test @MainActor func updatesOnVerdictEvent() async throws {
-        let mockWS = MockWebSocketService()
-        let mockSSE = MockSSEService()
-        let mockAPI = MockAPIClient()
-        let manager = ConnectionManager(
-            webSocketService: mockWS,
-            sseService: mockSSE,
-            apiClient: mockAPI
-        )
-        let appState = AppState(connectionManager: manager)
-        // Create verdict event
-        let verdict = VerdictEntry(
-            timestamp: Date(),
-            issueId: "TEST-2",
-            gate: "implement",
-            outcome: .pass,
-            reason: "All tests pass",
-            agent: "test-agent"
-        )
-        let payload = VerdictPayload(verdict: verdict)
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        let payloadData = try encoder.encode(payload)
-        let event = WebSocketEvent(type: .verdict, payload: payloadData)
-        appState.handleEvent(event)
-        #expect(appState.verdicts.count == 1)
-        #expect(appState.verdicts.first?.issueId == "TEST-2")
+    @Test @MainActor func toggleDashboard() async throws {
+        let appState = AppState()
+        #expect(appState.isDashboardOpen == false)
+        appState.toggleDashboard()
+        #expect(appState.isDashboardOpen == true)
+        appState.toggleDashboard()
+        #expect(appState.isDashboardOpen == false)
     }
 
-    @Test @MainActor func exposesConnectionStatus() async throws {
-        let mockWS = MockWebSocketService()
-        let mockSSE = MockSSEService()
-        let mockAPI = MockAPIClient()
-        let manager = ConnectionManager(
-            webSocketService: mockWS,
-            sseService: mockSSE,
-            apiClient: mockAPI
-        )
-        let appState = AppState(connectionManager: manager)
-        #expect(appState.connectionStatus == .disconnected)
+    @Test @MainActor func clearError() async throws {
+        let appState = AppState()
+        appState.lastError = "Test error"
+        #expect(appState.lastError == "Test error")
+        appState.clearError()
+        #expect(appState.lastError == nil)
     }
 
-    @Test @MainActor func handlesHeartbeatEvent() async throws {
-        let mockWS = MockWebSocketService()
-        let mockSSE = MockSSEService()
-        let mockAPI = MockAPIClient()
-        let manager = ConnectionManager(
-            webSocketService: mockWS,
-            sseService: mockSSE,
-            apiClient: mockAPI
-        )
-        let appState = AppState(connectionManager: manager)
-        // Create heartbeat event
-        let agent = AgentHeartbeat(
-            name: "agent-1",
-            lastSeen: Date(),
-            status: .active
-        )
-        let payload = HeartbeatPayload(agents: [agent], uptimeSeconds: 3600)
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        let payloadData = try encoder.encode(payload)
-        let event = WebSocketEvent(type: .heartbeat, payload: payloadData)
-        appState.handleEvent(event)
-        #expect(appState.agents.count == 1)
-        #expect(appState.agents.first?.name == "agent-1")
+    @Test @MainActor func connectionState() async throws {
+        let appState = AppState()
+        #expect(appState.isConnected == false)
+        appState.isConnected = true
+        #expect(appState.isConnected == true)
+    }
+
+    @Test @MainActor func selectedProject() async throws {
+        let appState = AppState()
+        #expect(appState.selectedProjectId == nil)
+        appState.selectedProjectId = "project-123"
+        #expect(appState.selectedProjectId == "project-123")
     }
 }
 
