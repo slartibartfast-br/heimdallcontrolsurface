@@ -1,39 +1,27 @@
-# PLAN: HCS-004 — WebSocket Service
+# PLAN: HCS-003 — HEIMDALL API Client
 
 ## Preflight Checklist
 
-### git status
+### 1. git status
 ```
-On branch feat/AASF-648
-Untracked files:
-  (use "git add <file>..." to include in what will be committed)
-	Sources/HEIMDALLControlSurface/Models/Agent.swift
-	Sources/HEIMDALLControlSurface/Models/Infrastructure.swift
-	Sources/HEIMDALLControlSurface/Models/KPI.swift
-	Sources/HEIMDALLControlSurface/Models/Pipeline.swift
-	Sources/HEIMDALLControlSurface/Models/Project.swift
-	Sources/HEIMDALLControlSurface/Models/Verdict.swift
-	Sources/HEIMDALLControlSurface/Services/HeimdallAPIClient.swift
-	Sources/HEIMDALLControlSurface/Services/JSONDecoding.swift
-	Sources/HEIMDALLControlSurface/Services/MockAPIClient.swift
-
-nothing added to commit but untracked files present (use "git add" to track)
+On branch feat/AASF-647
+nothing to commit, working tree clean
 ```
 
-### git branch
+### 2. git branch
 ```
-+ feat/AASF-646
-* feat/AASF-648
+* feat/AASF-647
 + main
 ```
 
-### ls data/queue/
+### 3. ls data/queue/
 ```
-ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-648/data/queue/: No such file or directory
+ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-647/data/queue/: No such file or directory
 ```
 (No queue directory exists — this is a Swift project, no stale envelopes)
 
-### Mandatory Rules from CLAUDE.md
+### 4. Mandatory Rules from CLAUDE.md
+
 1. Functions < 50 lines
 2. Read signatures before calling
 3. String matching: \b word boundaries only
@@ -41,7 +29,33 @@ ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-648/data/queue/: No
 5. One branch at a time
 6. Squash merge to main
 7. Every commit: (HCS-NNN)
-8. python -m pytest tests/ -q must pass before merge
+8. python -m pytest tests/ -q must pass before merge (Note: Swift project uses `swift test`)
+
+---
+
+## Summary
+
+HCS-003 requires implementing a REST client for the HEIMDALL monitor API with Codable models and unit tests.
+
+**IMPLEMENTATION STATUS:**
+
+| File | Path | Status | Lines |
+|------|------|--------|-------|
+| HeimdallAPIClient.swift | Services/HeimdallAPIClient.swift | COMPLETE | 186 |
+| MockAPIClient.swift | Services/MockAPIClient.swift | COMPLETE | 189 |
+| JSONDecoding.swift | Services/JSONDecoding.swift | COMPLETE | 66 |
+| Pipeline.swift | Models/Pipeline.swift | COMPLETE | 73 |
+| Verdict.swift | Models/Verdict.swift | COMPLETE | 60 |
+| Agent.swift | Models/Agent.swift | COMPLETE | 107 |
+| KPI.swift | Models/KPI.swift | COMPLETE | 83 |
+| Project.swift | Models/Project.swift | COMPLETE | 133 |
+| Infrastructure.swift | Models/Infrastructure.swift | COMPLETE | 105 |
+
+**GAP IDENTIFIED:** `ModelTests.swift` contains only a placeholder test (11 lines).
+
+Acceptance criteria require:
+- Unit tests achieve >80% coverage on models and client
+- Unit tests for Codable round-trip serialization
 
 ---
 
@@ -49,451 +63,244 @@ ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-648/data/queue/: No
 
 | Action | File | Purpose |
 |--------|------|---------|
-| CREATE | `Sources/.../Models/Event.swift` | WebSocket event models (factory_update, verdict, heartbeat) |
-| CREATE | `Sources/.../Services/WebSocketService.swift` | URLSession WebSocket connection with exponential backoff |
-| CREATE | `Sources/.../Services/SSEService.swift` | Server-Sent Events fallback service |
-| CREATE | `Sources/.../Services/ConnectionManager.swift` | Orchestrates WebSocket → SSE → REST fallback |
-| CREATE | `Sources/.../State/AppState.swift` | Observable state container for live updates |
-| MODIFY | `Tests/.../ServiceTests.swift` | Add WebSocket, SSE, ConnectionManager tests |
-
----
-
-## Design
-
-### Architecture Overview
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                      AppState                            │
-│   @Published pipelines, verdicts, connectionStatus       │
-└────────────────────────┬────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────┐
-│                  ConnectionManager                       │
-│   Orchestrates: WebSocket → SSE → REST polling          │
-│   Tracks: ConnectionStatus, retry logic                 │
-└───────┬──────────────────┬──────────────────┬───────────┘
-        │                  │                  │
-        ▼                  ▼                  ▼
-┌───────────────┐  ┌───────────────┐  ┌────────────────────┐
-│WebSocketService│ │  SSEService   │  │ HeimdallAPIClient  │
-│ws://host/ws/  │  │ /api/events   │  │  REST polling      │
-│   events      │  │   (SSE)       │  │  (existing)        │
-└───────────────┘  └───────────────┘  └────────────────────┘
-```
-
-### 1. Event Models (`Event.swift`)
-
-**Purpose:** Strongly-typed models for real-time WebSocket events.
-
-```swift
-// Event types matching HEIMDALL monitor backend
-public enum EventType: String, Codable, Sendable {
-    case factoryUpdate = "factory_update"
-    case verdict = "verdict"
-    case heartbeat = "heartbeat"
-    case pipelineUpdate = "pipeline_update"
-    case agentStatus = "agent_status"
-}
-
-// Wrapper for all events
-public struct WebSocketEvent: Codable, Sendable, Identifiable {
-    public let id: UUID
-    public let type: EventType
-    public let timestamp: Date
-    public let payload: Data  // Raw JSON for type-specific decoding
-}
-
-// Type-specific payloads
-public struct FactoryUpdatePayload: Codable, Sendable {
-    public let factoryStatus: FactoryStatus
-    public let pipelines: [PipelineEntry]
-}
-
-public struct VerdictPayload: Codable, Sendable {
-    public let verdict: VerdictEntry
-}
-
-public struct HeartbeatPayload: Codable, Sendable {
-    public let agents: [AgentHeartbeat]
-    public let uptimeSeconds: Int
-}
-```
-
-**Line estimate:** ~85 lines (models only, no logic)
-
-### 2. WebSocketService (`WebSocketService.swift`)
-
-**Purpose:** Manages URLSession WebSocket connection with reconnection logic.
-
-**Key Components:**
-
-```swift
-/// Connection state for WebSocket
-public enum WebSocketState: Sendable, Equatable {
-    case disconnected
-    case connecting
-    case connected
-    case reconnecting(attempt: Int)
-}
-
-/// Protocol for WebSocket service (enables mocking)
-public protocol WebSocketServiceProtocol: Sendable {
-    func connect() async throws
-    func disconnect() async
-    var events: AsyncStream<WebSocketEvent> { get }
-    var state: WebSocketState { get async }
-}
-
-/// URLSession-based WebSocket service with exponential backoff
-public actor WebSocketService: WebSocketServiceProtocol {
-    private let url: URL
-    private let session: URLSession
-    private var webSocketTask: URLSessionWebSocketTask?
-    private var reconnectAttempt: Int = 0
-    private let maxReconnectDelay: TimeInterval = 30.0
-    private let baseDelay: TimeInterval = 1.0
-
-    // Exponential backoff: 1s → 2s → 4s → 8s → 16s → 30s (capped)
-    private func reconnectDelay() -> TimeInterval
-
-    public func connect() async throws
-    public func disconnect() async
-    private func receiveMessages() async
-    private func scheduleReconnect() async
-}
-```
-
-**Guard/Recovery Pairs:**
-| Guard | Recovery |
-|-------|----------|
-| Connection fails | Schedule reconnect with exponential backoff |
-| Message decode error | Log warning, continue receiving |
-| Task cancelled | Clean disconnect, no reconnect |
-| Max retries reached | Notify delegate/callback of failure |
-
-**Line estimates per function:**
-- `reconnectDelay()`: 8 lines
-- `connect()`: 22 lines
-- `disconnect()`: 12 lines
-- `receiveMessages()`: 28 lines
-- `scheduleReconnect()`: 18 lines
-
-### 3. SSEService (`SSEService.swift`)
-
-**Purpose:** Server-Sent Events fallback when WebSocket unavailable.
-
-```swift
-/// SSE connection state
-public enum SSEState: Sendable, Equatable {
-    case disconnected
-    case connecting
-    case connected
-}
-
-/// Protocol for SSE service (enables mocking)
-public protocol SSEServiceProtocol: Sendable {
-    func connect() async throws
-    func disconnect() async
-    var events: AsyncStream<WebSocketEvent> { get }
-    var state: SSEState { get async }
-}
-
-/// URLSession-based SSE service
-public actor SSEService: SSEServiceProtocol {
-    private let url: URL
-    private let session: URLSession
-    private var dataTask: Task<Void, Never>?
-
-    public func connect() async throws
-    public func disconnect() async
-    private func parseSSELine(_ line: String) -> WebSocketEvent?
-    private func processStream(_ bytes: URLSession.AsyncBytes) async
-}
-```
-
-**Line estimates per function:**
-- `connect()`: 20 lines
-- `disconnect()`: 10 lines
-- `parseSSELine()`: 18 lines
-- `processStream()`: 25 lines
-
-### 4. ConnectionManager (`ConnectionManager.swift`)
-
-**Purpose:** Orchestrates connection strategy with fallback chain.
-
-```swift
-/// Overall connection status exposed to UI
-public enum ConnectionStatus: Sendable, Equatable {
-    case disconnected
-    case connecting(ConnectionMethod)
-    case connected(ConnectionMethod)
-    case reconnecting(ConnectionMethod, attempt: Int)
-    case failed(String)  // Error description
-}
-
-/// Connection method in use
-public enum ConnectionMethod: String, Sendable, CaseIterable {
-    case webSocket
-    case sse
-    case restPolling
-}
-
-/// Manages connection fallback chain: WebSocket → SSE → REST
-@MainActor
-public final class ConnectionManager: ObservableObject {
-    @Published public private(set) var status: ConnectionStatus = .disconnected
-
-    private let webSocketService: any WebSocketServiceProtocol
-    private let sseService: any SSEServiceProtocol
-    private let apiClient: any HeimdallAPIClientProtocol
-    private let pollingInterval: TimeInterval
-
-    private var activeTask: Task<Void, Never>?
-    private var webSocketRetries: Int = 0
-    private var sseRetries: Int = 0
-    private let maxRetries: Int = 3
-
-    public init(
-        webSocketService: any WebSocketServiceProtocol,
-        sseService: any SSEServiceProtocol,
-        apiClient: any HeimdallAPIClientProtocol,
-        pollingInterval: TimeInterval = 5.0
-    )
-
-    public func start() async
-    public func stop() async
-    private func tryWebSocket() async -> Bool
-    private func trySSE() async -> Bool
-    private func startPolling() async
-    private func handleEvent(_ event: WebSocketEvent)
-}
-```
-
-**Fallback Strategy:**
-1. Try WebSocket connection to `ws://host:7846/ws/events`
-2. If WebSocket fails 3 times → fallback to SSE at `/api/events`
-3. If SSE fails 3 times → fallback to REST polling
-4. REST polling continues indefinitely (uses existing HeimdallAPIClient)
-
-**Line estimates per function:**
-- `start()`: 28 lines
-- `stop()`: 12 lines
-- `tryWebSocket()`: 22 lines
-- `trySSE()`: 20 lines
-- `startPolling()`: 24 lines
-- `handleEvent()`: 15 lines
-
-### 5. AppState (`AppState.swift`)
-
-**Purpose:** Central observable state container for the entire app.
-
-```swift
-/// Central application state container
-@MainActor
-public final class AppState: ObservableObject {
-    // Connection status
-    @Published public var connectionStatus: ConnectionStatus = .disconnected
-
-    // Live data from real-time events
-    @Published public var pipelines: [PipelineEntry] = []
-    @Published public var verdicts: [VerdictEntry] = []
-    @Published public var agents: [AgentHeartbeat] = []
-    @Published public var factoryStatus: FactoryStatus = .stalled
-
-    // Services
-    private let connectionManager: ConnectionManager
-
-    public init(connectionManager: ConnectionManager)
-
-    public func start() async
-    public func stop() async
-
-    // Called by ConnectionManager when events arrive
-    internal func handleEvent(_ event: WebSocketEvent)
-}
-```
-
-**Line estimates per function:**
-- `init()`: 12 lines
-- `start()`: 18 lines
-- `stop()`: 10 lines
-- `handleEvent()`: 28 lines
+| MODIFY | `Tests/HEIMDALLControlSurfaceTests/ModelTests.swift` | Add Codable round-trip tests for all API models |
 
 ---
 
 ## Data Path Trace
 
-### WebSocket Event Flow
+### Encoding/Decoding Flow
+1. `JSONEncoder().encode(model)` → Data (line N/A, Foundation)
+2. `JSONDecoder.heimdallDecoder().decode(T.self, from: data)` → Model (JSONDecoding.swift:8-12)
+3. Verify original == decoded (via Equatable conformance)
 
-1. **WebSocketService.receiveMessages()** (line ~60)
-   - Calls `webSocketTask.receive()` in loop
-   - Decodes `WebSocketEvent` from JSON `.string` message
-   - Yields event to `AsyncStream<WebSocketEvent>`
+### Models to Test (with source locations)
 
-2. **ConnectionManager.tryWebSocket()** (line ~45)
-   - Awaits `for await event in webSocketService.events`
-   - Calls `handleEvent(event)`
+| Model | File | Lines |
+|-------|------|-------|
+| PipelineEntry | Models/Pipeline.swift | 17-49 |
+| PipelineResponse | Models/Pipeline.swift | 52-72 |
+| VerdictEntry | Models/Verdict.swift | 12-46 |
+| VerdictsResponse | Models/Verdict.swift | 49-59 |
+| AgentHeartbeat | Models/Agent.swift | 27-77 |
+| HeartbeatResponse | Models/Agent.swift | 80-93 |
+| AgentsResponse | Models/Agent.swift | 96-106 |
+| KPIMetric | Models/KPI.swift | 17-64 |
+| KPIResponse | Models/KPI.swift | 67-82 |
+| ServiceHealth | Models/Infrastructure.swift | 12-41 |
+| InfraResponse | Models/Infrastructure.swift | 44-52 |
+| DecisionEntry | Models/Infrastructure.swift | 55-84 |
+| DecisionsResponse | Models/Infrastructure.swift | 87-104 |
+| IssueCounts | Models/Project.swift | 12-28 |
+| SwitcherProject | Models/Project.swift | 31-76 |
+| SwitcherResponse | Models/Project.swift | 79-99 |
+| ProjectIssue | Models/Project.swift | 102-132 |
+| ApprovalResult | Services/HeimdallAPIClient.swift | 16-26 |
 
-3. **ConnectionManager.handleEvent()** (line ~95)
-   - Forwards event to `AppState` via callback or direct reference
+### Enums to Test
 
-4. **AppState.handleEvent()** (line ~55)
-   - Pattern matches on `event.type`
-   - Decodes type-specific payload from `event.payload`
-   - Updates appropriate `@Published` property
-   - SwiftUI views auto-refresh via Combine
+| Enum | File | Values |
+|------|------|--------|
+| PipelineStatus | Models/Pipeline.swift:7-9 | running, blocked, idle, stalled |
+| FactoryStatus | Models/Pipeline.swift:12-14 | healthy, degraded, stalled |
+| VerdictOutcome | Models/Verdict.swift:7-9 | pass, fail, escalate |
+| AgentStatus | Models/Agent.swift:7-9 | active, idle, dead |
+| AgentState | Models/Agent.swift:12-17 | IDLE, EXECUTING, ERROR, COOLDOWN |
+| ExecutorType | Models/Agent.swift:20-24 | claude-code, cascade, agent-sdk |
+| KPITrend | Models/KPI.swift:7-9 | up, down, flat |
+| KPIFormat | Models/KPI.swift:12-14 | number, percentage, duration, rate |
+| ServiceHealthStatus | Models/Infrastructure.swift:7-9 | healthy, degraded, unhealthy, unknown |
+| SwitcherStatus | Models/Project.swift:7-9 | active, standby, blocked, error |
 
-### Fallback Chain Activation
+---
 
-1. **ConnectionManager.start()** (line ~25)
-   - Calls `tryWebSocket()`
-   - On success: remains in WebSocket mode
-   - On failure: increments `webSocketRetries`
+## Detailed Changes
 
-2. **ConnectionManager.tryWebSocket()** (line ~45)
-   - Catches connection error after `maxRetries` (3)
-   - Updates `status = .connecting(.sse)`
-   - Calls `trySSE()`
+### File: Tests/HEIMDALLControlSurfaceTests/ModelTests.swift
 
-3. **ConnectionManager.trySSE()** (line ~70)
-   - Catches connection error after `maxRetries` (3)
-   - Updates `status = .connecting(.restPolling)`
-   - Calls `startPolling()`
+**Current State:** 11 lines with placeholder test only
 
-4. **ConnectionManager.startPolling()** (line ~95)
-   - Uses existing `HeimdallAPIClient.fetchPipeline()`
-   - Polls every `pollingInterval` (5 seconds)
-   - Wraps REST response in `WebSocketEvent` format
-   - Continues indefinitely until `stop()` called
+```swift
+import Testing
+@testable import HEIMDALLControlSurface
+
+@Suite("Model Tests")
+struct ModelTests {
+    @Test func placeholder() async throws {
+        // Placeholder test - to be implemented with models
+        #expect(true)
+    }
+}
+```
+
+**Proposed State:** Complete Codable round-trip test suite (~180 lines)
+
+```swift
+import Testing
+import Foundation
+@testable import HEIMDALLControlSurface
+
+@Suite("Model Tests")
+struct ModelTests {
+
+    // MARK: - Pipeline Models
+
+    @Test func pipelineEntryRoundTrip() async throws {
+        let original = PipelineEntry(
+            issueId: "AASF-100",
+            phase: "implement",
+            agent: "odin",
+            status: .running,
+            startedAt: Date(timeIntervalSince1970: 1712400000),
+            lastHeartbeat: Date(timeIntervalSince1970: 1712400060)
+        )
+        let decoded = try roundTrip(original)
+        #expect(decoded.issueId == original.issueId)
+        #expect(decoded.phase == original.phase)
+        #expect(decoded.status == original.status)
+    }
+
+    @Test func pipelineResponseRoundTrip() async throws {
+        let entry = PipelineEntry(...)
+        let original = PipelineResponse(
+            pipelines: [entry],
+            factoryStatus: .healthy,
+            timestamp: Date(timeIntervalSince1970: 1712400000)
+        )
+        let decoded = try roundTrip(original)
+        #expect(decoded.pipelines.count == 1)
+        #expect(decoded.factoryStatus == .healthy)
+    }
+
+    // ... similar tests for all 18 models ...
+
+    // MARK: - Enum Tests
+
+    @Test func pipelineStatusRoundTrip() async throws {
+        for status in [PipelineStatus.running, .blocked, .idle, .stalled] {
+            let decoded = try roundTrip(status)
+            #expect(decoded == status)
+        }
+    }
+
+    // ... similar tests for all 10 enums ...
+
+    // MARK: - JSON Decoding Edge Cases
+
+    @Test func dateDecodingISO8601() async throws {
+        let json = """
+        {"timestamp": "2024-04-06T12:00:00Z", ...}
+        """
+        // Test ISO8601 parsing in heimdallDecoder
+    }
+
+    @Test func dateDecodingUnixTimestamp() async throws {
+        let json = """
+        {"timestamp": 1712404800, ...}
+        """
+        // Test Unix timestamp parsing
+    }
+
+    // MARK: - Helper
+
+    private func roundTrip<T: Codable>(_ value: T) throws -> T {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder.heimdallDecoder()
+        let data = try encoder.encode(value)
+        return try decoder.decode(T.self, from: data)
+    }
+}
+```
 
 ---
 
 ## Function Size Plan
 
-All functions planned to be under 50 lines. Detailed breakdown:
+**ModelTests.swift** - Test file:
 
-| File | Function | Planned Lines | Notes |
-|------|----------|---------------|-------|
-| Event.swift | (models only) | N/A | No functions, just structs/enums |
-| WebSocketService.swift | `init()` | 8 | Simple property initialization |
-| WebSocketService.swift | `reconnectDelay()` | 8 | min(baseDelay * 2^attempt, maxDelay) |
-| WebSocketService.swift | `connect()` | 22 | Create task, setup continuation |
-| WebSocketService.swift | `disconnect()` | 12 | Cancel task, nil out references |
-| WebSocketService.swift | `receiveMessages()` | 28 | Receive loop with decode |
-| WebSocketService.swift | `scheduleReconnect()` | 18 | Delay + recursive connect |
-| SSEService.swift | `init()` | 6 | Simple initialization |
-| SSEService.swift | `connect()` | 20 | Setup bytes stream |
-| SSEService.swift | `disconnect()` | 10 | Cancel task |
-| SSEService.swift | `parseSSELine()` | 18 | Parse "data:" prefix, decode JSON |
-| SSEService.swift | `processStream()` | 25 | Read lines, yield events |
-| ConnectionManager.swift | `init()` | 10 | Store dependencies |
-| ConnectionManager.swift | `start()` | 28 | Orchestrate fallback chain |
-| ConnectionManager.swift | `stop()` | 12 | Cancel active task |
-| ConnectionManager.swift | `tryWebSocket()` | 22 | Connect + handle events |
-| ConnectionManager.swift | `trySSE()` | 20 | Connect + handle events |
-| ConnectionManager.swift | `startPolling()` | 24 | Polling loop |
-| ConnectionManager.swift | `handleEvent()` | 15 | Forward to AppState |
-| AppState.swift | `init()` | 12 | Setup bindings |
-| AppState.swift | `start()` | 18 | Start ConnectionManager |
-| AppState.swift | `stop()` | 10 | Stop ConnectionManager |
-| AppState.swift | `handleEvent()` | 28 | Switch on event type, update state |
+| Function/Test | Lines | Notes |
+|---------------|-------|-------|
+| `roundTrip<T>()` | 6 | Generic encode/decode helper |
+| Each `@Test` function | 5-10 | Create instance, roundTrip, verify fields |
+| Total file | ~180 | 30+ tests, all under 50 lines each |
 
-**All functions ≤ 28 lines — well under 50-line limit.**
+**No function will exceed 50 lines.**
 
 ---
 
-## Test Strategy
+## Equatable Conformance Analysis
 
-### File: `Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift`
+Swift auto-synthesizes `Equatable` for structs where all stored properties are `Equatable`. Verification:
 
-Replace placeholder test with comprehensive test suite:
+| Model | Properties | All Equatable? |
+|-------|------------|----------------|
+| PipelineEntry | String, String, String, PipelineStatus, Date, Date | ✅ Yes |
+| PipelineResponse | [PipelineEntry], FactoryStatus, Date | ✅ Yes |
+| VerdictEntry | Date, String×4, VerdictOutcome | ✅ Yes |
+| VerdictsResponse | [VerdictEntry], Int, Date | ✅ Yes |
+| AgentHeartbeat | String, Date, AgentStatus, String?, ExecutorType?, AgentState?, String?, Int?×3 | ✅ Yes |
+| HeartbeatResponse | [AgentHeartbeat], Int | ✅ Yes |
+| AgentsResponse | [AgentHeartbeat], Int, Double | ✅ Yes |
+| KPIMetric | String×4, Double×2, [Double], KPIFormat, Double?×2, Bool? | ✅ Yes |
+| KPIResponse | [KPIMetric], Double, Int | ✅ Yes |
+| ServiceHealth | String, ServiceHealthStatus, Double?, Date?, String? | ✅ Yes |
+| InfraResponse | [ServiceHealth], Double | ✅ Yes |
+| DecisionEntry | String×6 | ✅ Yes |
+| DecisionsResponse | [DecisionEntry], Int, String?, Double | ✅ Yes |
+| IssueCounts | Int×3 | ✅ Yes |
+| SwitcherProject | String×4, SwitcherStatus, IssueCounts, Int, [Int], Double, Bool, String | ✅ Yes |
+| SwitcherResponse | [SwitcherProject], String, Double | ✅ Yes |
+| ProjectIssue | String×2, String?×3, Int? | ✅ Yes |
+| ApprovalResult | Bool, String?×2 | ✅ Yes |
 
-**WebSocket Tests:**
-```swift
-@Suite("WebSocket Service Tests")
-struct WebSocketServiceTests {
-    @Test func connectsToValidURL() async throws
-    @Test func yieldsEventsOnMessage() async throws
-    @Test func exponentialBackoffCalculation() async throws
-    @Test func maxReconnectDelayCapped() async throws
-    @Test func disconnectCancelsTask() async throws
-}
-```
-
-**SSE Tests:**
-```swift
-@Suite("SSE Service Tests")
-struct SSEServiceTests {
-    @Test func parsesDataLine() async throws
-    @Test func ignoresCommentLines() async throws
-    @Test func handlesMultilineData() async throws
-}
-```
-
-**ConnectionManager Tests:**
-```swift
-@Suite("Connection Manager Tests")
-struct ConnectionManagerTests {
-    @Test func startsWithWebSocket() async throws
-    @Test func fallsBackToSSEAfterRetries() async throws
-    @Test func fallsBackToPollingAfterSSEFails() async throws
-    @Test func reportsCorrectStatus() async throws
-    @Test func stopCancelsActiveConnection() async throws
-}
-```
-
-**AppState Tests:**
-```swift
-@Suite("AppState Tests")
-struct AppStateTests {
-    @Test func updatesOnFactoryEvent() async throws
-    @Test func updatesOnVerdictEvent() async throws
-    @Test func exposesConnectionStatus() async throws
-}
-```
-
-### Mock Infrastructure
-
-Create mocks for testing:
-
-```swift
-// In ServiceTests.swift
-actor MockWebSocketService: WebSocketServiceProtocol {
-    var shouldFail: Bool = false
-    var eventsToYield: [WebSocketEvent] = []
-    private(set) var state: WebSocketState = .disconnected
-
-    var events: AsyncStream<WebSocketEvent> { ... }
-    func connect() async throws { ... }
-    func disconnect() async { ... }
-}
-
-actor MockSSEService: SSEServiceProtocol {
-    var shouldFail: Bool = false
-    var eventsToYield: [WebSocketEvent] = []
-    private(set) var state: SSEState = .disconnected
-
-    var events: AsyncStream<WebSocketEvent> { ... }
-    func connect() async throws { ... }
-    func disconnect() async { ... }
-}
-```
+**Conclusion:** No explicit `Equatable` conformance needed — Swift synthesizes automatically.
 
 ---
 
-## Verification Plan
+## Test Verification Plan
 
-| Acceptance Criterion | Test Method | Verification |
-|---------------------|-------------|--------------|
-| WebSocket connects to ws://host:7846/ws/events | `@Test connectsToValidURL` | Mock verifies URL passed |
-| Factory events update AppState | `@Test updatesOnFactoryEvent` | Check `@Published` property |
-| Automatic reconnection with exponential backoff | `@Test exponentialBackoffCalculation` | Verify delays: 1s→2s→4s→...→30s |
-| Graceful fallback to SSE | `@Test fallsBackToSSEAfterRetries` | Status changes after 3 WS failures |
-| Graceful fallback to REST | `@Test fallsBackToPollingAfterSSEFails` | Status changes after 3 SSE failures |
-| Connection status visible in AppState | `@Test exposesConnectionStatus` | Verify `connectionStatus` updates |
-| No memory leaks | Manual | Verify weak refs, task cancellation |
+### Test File: Tests/HEIMDALLControlSurfaceTests/ModelTests.swift
+
+| Test Case | Model Tested | Verification |
+|-----------|--------------|--------------|
+| `pipelineEntryRoundTrip` | PipelineEntry | All 6 fields match after encode/decode |
+| `pipelineResponseRoundTrip` | PipelineResponse | pipelines array, factoryStatus, timestamp match |
+| `verdictEntryRoundTrip` | VerdictEntry | All fields including outcome enum match |
+| `verdictsResponseRoundTrip` | VerdictsResponse | verdicts array and count match |
+| `agentHeartbeatRoundTrip` | AgentHeartbeat | All fields including optionals match |
+| `heartbeatResponseRoundTrip` | HeartbeatResponse | agents array and uptimeSeconds match |
+| `agentsResponseRoundTrip` | AgentsResponse | All fields match |
+| `kpiMetricRoundTrip` | KPIMetric | Sparkline array, optional thresholds match |
+| `kpiResponseRoundTrip` | KPIResponse | kpis array with all metrics match |
+| `serviceHealthRoundTrip` | ServiceHealth | Optional latencyMs and lastCheck handled |
+| `infraResponseRoundTrip` | InfraResponse | services array matches |
+| `decisionEntryRoundTrip` | DecisionEntry | All string fields match |
+| `decisionsResponseRoundTrip` | DecisionsResponse | Optional project field handled |
+| `issueCountsRoundTrip` | IssueCounts | Snake_case key mapping works |
+| `switcherProjectRoundTrip` | SwitcherProject | Nested IssueCounts decodes correctly |
+| `switcherResponseRoundTrip` | SwitcherResponse | projects array matches |
+| `projectIssueRoundTrip` | ProjectIssue | Optional fields handled correctly |
+| `approvalResultRoundTrip` | ApprovalResult | Optional message/error handled |
+| `pipelineStatusRoundTrip` | PipelineStatus | All 4 enum cases round-trip |
+| `factoryStatusRoundTrip` | FactoryStatus | All 3 enum cases round-trip |
+| `verdictOutcomeRoundTrip` | VerdictOutcome | All 3 enum cases round-trip |
+| `agentStatusRoundTrip` | AgentStatus | All 3 enum cases round-trip |
+| `agentStateRoundTrip` | AgentState | All 4 enum cases (raw values IDLE, etc.) |
+| `executorTypeRoundTrip` | ExecutorType | All 3 enum cases (raw values claude-code, etc.) |
+| `kpiTrendRoundTrip` | KPITrend | All 3 enum cases round-trip |
+| `kpiFormatRoundTrip` | KPIFormat | All 4 enum cases round-trip |
+| `serviceHealthStatusRoundTrip` | ServiceHealthStatus | All 4 enum cases round-trip |
+| `switcherStatusRoundTrip` | SwitcherStatus | All 4 enum cases round-trip |
+| `dateDecodingISO8601` | JSONDecoder | ISO8601 string parsed correctly |
+| `dateDecodingUnixTimestamp` | JSONDecoder | Unix timestamp parsed correctly |
+| `dateDecodingWithFractionalSeconds` | JSONDecoder | ISO8601 with .SSSS parsed |
+
+### Run Command
+```bash
+cd /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-647
+swift test --filter ModelTests
+```
 
 ---
 
@@ -501,33 +308,9 @@ actor MockSSEService: SSEServiceProtocol {
 
 | Risk | Mitigation |
 |------|------------|
-| URLSession WebSocket not available on older macOS | Target macOS 14+ (already in Package.swift) |
-| Memory leaks from uncancelled tasks | Use structured concurrency, cancel in `disconnect()` |
-| Race conditions in reconnect logic | Use actor isolation for WebSocketService/SSEService |
-| Event payload schema mismatch | Use optional fields with defaults, log decode warnings |
-| Connection manager state corruption | @MainActor isolation, single `activeTask` |
-
----
-
-## Commit Plan
-
-**Commit 1:** Event models (HCS-004)
-- `Sources/HEIMDALLControlSurface/Models/Event.swift`
-
-**Commit 2:** WebSocket service (HCS-004)
-- `Sources/HEIMDALLControlSurface/Services/WebSocketService.swift`
-
-**Commit 3:** SSE fallback (HCS-004)
-- `Sources/HEIMDALLControlSurface/Services/SSEService.swift`
-
-**Commit 4:** Connection manager + AppState (HCS-004)
-- `Sources/HEIMDALLControlSurface/Services/ConnectionManager.swift`
-- `Sources/HEIMDALLControlSurface/State/AppState.swift`
-
-**Commit 5:** Tests (HCS-004)
-- `Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift`
-
-Each commit ≤ 5 files per Rule 4.
+| Date encoding mismatch | Use `.iso8601` encoding, heimdallDecoder handles both formats |
+| Optional field nil after decode | Test both nil and non-nil cases |
+| Enum raw value case sensitivity | Tests verify exact raw value strings |
 
 ---
 
@@ -535,43 +318,13 @@ Each commit ≤ 5 files per Rule 4.
 
 ```json
 {
-  "issue_ref": "HCS-004",
+  "issue_ref": "HCS-003",
   "deliverables": [
     {
-      "file": "Sources/HEIMDALLControlSurface/Models/Event.swift",
+      "file": "Tests/HEIMDALLControlSurfaceTests/ModelTests.swift",
       "function": "",
-      "change_description": "CREATE: WebSocket event models (EventType enum, WebSocketEvent struct, FactoryUpdatePayload, VerdictPayload, HeartbeatPayload)",
-      "verification": "swift build compiles without errors"
-    },
-    {
-      "file": "Sources/HEIMDALLControlSurface/Services/WebSocketService.swift",
-      "function": "WebSocketService (actor)",
-      "change_description": "CREATE: Actor-based WebSocket service with connect(), disconnect(), receiveMessages(), exponential backoff reconnection (1s→30s cap)",
-      "verification": "@Test connectsToValidURL, @Test exponentialBackoffCalculation, @Test maxReconnectDelayCapped"
-    },
-    {
-      "file": "Sources/HEIMDALLControlSurface/Services/SSEService.swift",
-      "function": "SSEService (actor)",
-      "change_description": "CREATE: Actor-based SSE fallback service with connect(), disconnect(), parseSSELine(), processStream()",
-      "verification": "@Test parsesDataLine, @Test ignoresCommentLines"
-    },
-    {
-      "file": "Sources/HEIMDALLControlSurface/Services/ConnectionManager.swift",
-      "function": "ConnectionManager (@MainActor class)",
-      "change_description": "CREATE: ObservableObject that orchestrates WebSocket → SSE → REST fallback with ConnectionStatus enum, maxRetries=3",
-      "verification": "@Test fallsBackToSSEAfterRetries, @Test fallsBackToPollingAfterSSEFails, @Test reportsCorrectStatus"
-    },
-    {
-      "file": "Sources/HEIMDALLControlSurface/State/AppState.swift",
-      "function": "AppState (@MainActor class)",
-      "change_description": "CREATE: Central ObservableObject with @Published properties for pipelines, verdicts, agents, factoryStatus, connectionStatus. handleEvent() dispatches by type.",
-      "verification": "@Test updatesOnFactoryEvent, @Test updatesOnVerdictEvent, @Test exposesConnectionStatus"
-    },
-    {
-      "file": "Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift",
-      "function": "",
-      "change_description": "MODIFY: Replace placeholder with WebSocketServiceTests, SSEServiceTests, ConnectionManagerTests, AppStateTests suites. Add MockWebSocketService, MockSSEService.",
-      "verification": "swift test passes all new tests"
+      "change_description": "MODIFY: Replace placeholder test with comprehensive Codable round-trip tests for all API models: PipelineEntry, PipelineResponse, VerdictEntry, VerdictsResponse, AgentHeartbeat, HeartbeatResponse, AgentsResponse, KPIMetric, KPIResponse, ServiceHealth, InfraResponse, DecisionEntry, DecisionsResponse, IssueCounts, SwitcherProject, SwitcherResponse, ProjectIssue, ApprovalResult. Plus enum round-trip tests for all 10 enums (PipelineStatus, FactoryStatus, VerdictOutcome, AgentStatus, AgentState, ExecutorType, KPITrend, KPIFormat, ServiceHealthStatus, SwitcherStatus) and date decoding edge case tests for ISO8601 and Unix timestamps.",
+      "verification": "swift test --filter ModelTests passes with all tests green"
     }
   ]
 }
