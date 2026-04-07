@@ -18,7 +18,10 @@ struct HEIMDALLControlSurfaceApp: App {
         MenuBarExtra("HEIMDALL", systemImage: "circle.hexagongrid.fill") {
             MenuBarView()
                 .environment(appState)
-                .onAppear { wireNotifications() }
+                .onAppear {
+                    wireNotifications()
+                    wireHotkeys()
+                }
         }
         .menuBarExtraStyle(.window)
 
@@ -42,5 +45,28 @@ struct HEIMDALLControlSurfaceApp: App {
         let baseURL = URL(string: "http://localhost:7846")!
         let apiClient = HeimdallAPIClient(baseURL: baseURL)
         appState.configure(notificationService: notificationService, apiClient: apiClient)
+    }
+
+    /// Wire global hotkey handlers (HCS-008)
+    private func wireHotkeys() {
+        guard let hotkeyService = appDelegate.hotkeyService else { return }
+
+        hotkeyService.setHandler(for: .toggleDashboard) { [weak appState] in
+            Task { @MainActor in
+                appState?.toggleDashboard()
+                NotificationCenter.default.post(name: .openDashboard, object: nil)
+                NSApp.activate(ignoringOtherApps: true)
+            }
+        }
+
+        hotkeyService.setHandler(for: .approveNext) { [weak appState] in
+            Task { @MainActor in await appState?.approveNext() }
+        }
+
+        hotkeyService.setHandler(for: .rejectNext) { [weak appState] in
+            Task { @MainActor in await appState?.rejectNext() }
+        }
+
+        hotkeyService.registerHotkeys()
     }
 }

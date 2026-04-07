@@ -126,6 +126,30 @@ final class AppState: @unchecked Sendable {
     private func cleanupAction(_ action: ApprovalAction) {
         pendingActions.removeAll { $0.id == action.id }
     }
+
+    // MARK: - Global Hotkey Actions (HCS-008)
+
+    /// Approve the next pending item in queue
+    func approveNext() async {
+        guard let approval = pendingApprovals.first else { return }
+        do {
+            _ = try await apiClient?.approve(id: approval.id)
+            pendingApprovals.removeFirst()
+        } catch {
+            lastError = "Approve failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Reject the next pending item in queue
+    func rejectNext() async {
+        guard let approval = pendingApprovals.first else { return }
+        do {
+            _ = try await apiClient?.reject(id: approval.id, reason: nil)
+            pendingApprovals.removeFirst()
+        } catch {
+            lastError = "Reject failed: \(error.localizedDescription)"
+        }
+    }
 }
 
 // MARK: - ConnectionEventHandler Conformance (HCS-006)
