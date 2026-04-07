@@ -1,6 +1,8 @@
 // Sources/HEIMDALLControlSurface/AppState.swift
 // HCS-002: Observable state container for UI reactivity
+// HCS-005: Extended with pending approvals queue
 // HCS-006: Extended with escalation handling and notification support
+// HCS-007: Extended with event stream storage and sound alerts
 
 import SwiftUI
 
@@ -45,9 +47,15 @@ final class AppState: @unchecked Sendable {
     // Pending actions with undo window (HCS-005)
     var pendingActions: [ApprovalAction] = []
 
+    // Event stream for real-time display (HCS-007)
+    var events: [WebSocketEvent] = []
+    private let maxEvents: Int = 500
+
     // Notification service (injected, HCS-006)
     private var notificationService: (any NotificationServiceProtocol)?
     private var apiClient: (any HeimdallAPIClientProtocol)?
+    // Sound alert service (HCS-007)
+    private var soundService: (any SoundAlertServiceProtocol)?
 
     // Toggle dashboard visibility
     func toggleDashboard() {
@@ -59,17 +67,21 @@ final class AppState: @unchecked Sendable {
         lastError = nil
     }
 
-    /// Configure services (called from AppDelegate, HCS-006)
+    /// Configure services (called from AppDelegate, HCS-006, HCS-007)
     func configure(
         notificationService: any NotificationServiceProtocol,
-        apiClient: any HeimdallAPIClientProtocol
+        apiClient: any HeimdallAPIClientProtocol,
+        soundService: (any SoundAlertServiceProtocol)? = nil
     ) {
         self.notificationService = notificationService
         self.apiClient = apiClient
+        self.soundService = soundService ?? SoundAlertService()
     }
+}
 
-    // MARK: - Pending Approvals (HCS-005)
+// MARK: - Pending Approvals (HCS-005)
 
+extension AppState {
     /// Refresh pending approvals from API
     func refreshPendingApprovals() async throws {
         guard let apiClient else { return }
@@ -128,10 +140,15 @@ final class AppState: @unchecked Sendable {
     }
 }
 
-// MARK: - ConnectionEventHandler Conformance (HCS-006)
+// MARK: - ConnectionEventHandler Conformance (HCS-006, HCS-007)
 
 extension AppState: ConnectionEventHandler {
     func handleEvent(_ event: WebSocketEvent) {
+        // HCS-007: Store event for EventStreamView
+        storeEvent(event)
+        // HCS-007: Play sound alert
+        soundService?.playSound(for: event.type)
+        // HCS-006: Handle specific event types
         switch event.type {
         case .verdict:
             handleVerdictEvent(event)
@@ -139,6 +156,14 @@ extension AppState: ConnectionEventHandler {
             handleEscalationEvent(event)
         default:
             break
+        }
+    }
+
+    /// Store event in the events array, capped at maxEvents (HCS-007)
+    private func storeEvent(_ event: WebSocketEvent) {
+        events.append(event)
+        if events.count > maxEvents {
+            events.removeFirst(events.count - maxEvents)
         }
     }
 

@@ -130,11 +130,14 @@ final class MockAPIClient: HeimdallAPIClientProtocol, @unchecked Sendable {
     func reject(id: String, reason: String?) async throws -> ApprovalResult {
         ApprovalResult(ok: true)
     }
+
+    // HCS-005: Hold and pending approvals
     func hold(id: String) async throws -> ApprovalResult {
         ApprovalResult(ok: true)
     }
+
     func fetchPendingApprovals() async throws -> PendingApprovalsResponse {
-        PendingApprovalsResponse(approvals: [], count: 0, timestamp: 0)
+        PendingApprovalsResponse(approvals: [], count: 0, timestamp: Date().timeIntervalSince1970)
     }
 }
 

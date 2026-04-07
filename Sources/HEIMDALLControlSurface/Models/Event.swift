@@ -6,13 +6,21 @@ import Foundation
 // MARK: - Event Types
 
 /// Event types matching HEIMDALL monitor backend
-public enum EventType: String, Codable, Sendable {
+public enum EventType: String, Codable, Sendable, CaseIterable {
     case factoryUpdate = "factory_update"
     case verdict = "verdict"
     case heartbeat = "heartbeat"
     case pipelineUpdate = "pipeline_update"
     case agentStatus = "agent_status"
     case escalation = "escalation"  // HCS-006: explicit escalation events
+}
+
+/// Event severity for filtering and display (HCS-007)
+public enum EventSeverity: String, Codable, Sendable, CaseIterable {
+    case info
+    case warning
+    case error
+    case critical
 }
 
 // MARK: - WebSocket Event Wrapper
@@ -147,6 +155,59 @@ extension WebSocketEvent {
     /// Extract heartbeat payload
     public func heartbeatPayload() throws -> HeartbeatPayload {
         try decodePayload(as: HeartbeatPayload.self)
+    }
+}
+
+// MARK: - Severity Inference (HCS-007)
+
+extension WebSocketEvent {
+    /// Inferred severity based on event type and payload
+    public var severity: EventSeverity {
+        switch type {
+        case .heartbeat:
+            return .info
+        case .factoryUpdate, .pipelineUpdate, .agentStatus:
+            return .info
+        case .verdict:
+            if let payload = try? verdictPayload() {
+                return payload.verdict.outcome == .escalate ? .critical : .info
+            }
+            return .info
+        case .escalation:
+            return .critical
+        }
+    }
+}
+
+// MARK: - Project Extraction (HCS-007)
+
+extension WebSocketEvent {
+    /// Extract project code from event payload (e.g., "AASF" from "AASF-123")
+    public var projectCode: String? {
+        extractIssueId().flatMap { Self.extractProjectCode(from: $0) }
+    }
+
+    /// Extract issue ID from various payload types
+    private func extractIssueId() -> String? {
+        switch type {
+        case .verdict, .escalation:
+            return (try? verdictPayload())?.verdict.issueId
+        case .pipelineUpdate:
+            return (try? decodePayload(as: PipelineUpdatePayload.self))?.pipeline.issueId
+        case .factoryUpdate:
+            return (try? factoryUpdatePayload())?.pipelines.first?.issueId
+        case .agentStatus:
+            return nil  // Agent status is not project-specific
+        case .heartbeat:
+            return nil  // Heartbeat is not project-specific
+        }
+    }
+
+    /// Extract project code prefix from issue ID (e.g., "AASF-123" → "AASF")
+    static func extractProjectCode(from issueId: String) -> String? {
+        let parts = issueId.split(separator: "-")
+        guard parts.count >= 2, let first = parts.first else { return nil }
+        return String(first)
     }
 }
 
