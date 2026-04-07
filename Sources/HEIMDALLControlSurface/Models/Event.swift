@@ -15,6 +15,16 @@ public enum EventType: String, Codable, Sendable {
     case escalation = "escalation"  // HCS-006: explicit escalation events
 }
 
+// MARK: - Event Severity (HCS-007)
+
+/// Event severity for filtering and display
+public enum EventSeverity: String, Codable, Sendable, CaseIterable {
+    case info
+    case warning
+    case error
+    case critical
+}
+
 // MARK: - WebSocket Event Wrapper
 
 /// Wrapper for all WebSocket events with type-safe payload access
@@ -204,5 +214,48 @@ struct AnyCodable: Codable {
         default:
             try container.encodeNil()
         }
+    }
+}
+
+// MARK: - Severity and Project Extraction (HCS-007)
+
+extension WebSocketEvent {
+    /// Inferred severity based on event type and payload
+    public var severity: EventSeverity {
+        switch type {
+        case .heartbeat:
+            return .info
+        case .factoryUpdate, .pipelineUpdate, .agentStatus:
+            return .info
+        case .verdict:
+            guard let payload = try? verdictPayload() else { return .info }
+            switch payload.verdict.outcome {
+            case .pass: return .info
+            case .fail: return .warning
+            case .escalate: return .critical
+            }
+        case .escalation:
+            return .critical
+        }
+    }
+
+    /// Extract project code from event payload (for filtering)
+    public var projectCode: String? {
+        switch type {
+        case .verdict, .escalation:
+            guard let payload = try? verdictPayload() else { return nil }
+            return extractProjectCode(from: payload.verdict.issueId)
+        case .pipelineUpdate:
+            guard let payload = try? decodePayload(as: PipelineUpdatePayload.self) else { return nil }
+            return extractProjectCode(from: payload.pipeline.issueId)
+        case .factoryUpdate, .heartbeat, .agentStatus:
+            return nil
+        }
+    }
+
+    /// Extract project code prefix from issue ID (e.g., "AASF-123" → "AASF")
+    private func extractProjectCode(from issueId: String) -> String? {
+        guard let dashIndex = issueId.firstIndex(of: "-") else { return nil }
+        return String(issueId[..<dashIndex])
     }
 }

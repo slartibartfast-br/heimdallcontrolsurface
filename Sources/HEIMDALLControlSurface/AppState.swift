@@ -45,6 +45,9 @@ final class AppState: @unchecked Sendable {
     // Pending actions with undo window (HCS-005)
     var pendingActions: [ApprovalAction] = []
 
+    // Event stream view model (HCS-007)
+    var eventStreamViewModel: EventStreamViewModel = EventStreamViewModel()
+
     // Notification service (injected, HCS-006)
     private var notificationService: (any NotificationServiceProtocol)?
     private var apiClient: (any HeimdallAPIClientProtocol)?
@@ -156,6 +159,9 @@ final class AppState: @unchecked Sendable {
 
 extension AppState: ConnectionEventHandler {
     func handleEvent(_ event: WebSocketEvent) {
+        // Forward all events to stream view model (HCS-007)
+        eventStreamViewModel.addEvent(event)
+
         switch event.type {
         case .verdict:
             handleVerdictEvent(event)
