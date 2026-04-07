@@ -12,7 +12,8 @@ The EXECUTE IMMEDIATELY rule does NOT apply in plan phase.
 
 ## IMPLEMENT PHASE
 Execute immediately. First action is a tool call or file write.
-Write code, run tests, commit — fully autonomous.
+Write code, run tests — fully autonomous.
+Do NOT git commit or git push — the ship phase handles that after architect approval.
 
 ## SHIP PHASE
 Follow config/workflows/ship.md. Post implementation notes before Done.
