@@ -1,32 +1,28 @@
-# PLAN: HCS-006 — Notification Service
+# PLAN: HCS-008 — Global Hotkeys
 
 ## Preflight Checklist
 
-### git status
+### 1. git status
 ```
-On branch feat/AASF-672
-Untracked files:
-  (use "git add <file>..." to include in what will be committed)
-	.mcp.json.heimdall-backup
-
-nothing added to commit but untracked files present (use "git add" to track)
+On branch feat/HCS-008
+nothing to commit, working tree clean
 ```
 
-### git branch
+### 2. git branch
 ```
-+ feat/AASF-647
-+ feat/AASF-671
-* feat/AASF-672
+  feat/AASF-647
+  feat/AASF-673
+* feat/HCS-008
 + main
 ```
 
-### ls data/queue/
+### 3. ls data/queue/
 ```
-ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-672/data/queue/: No such file or directory
+ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-674/data/queue/: No such file or directory
 ```
-(No queue directory exists — this is a Swift project, no stale envelopes)
+(No queue directory — this is a Swift project, no stale envelopes)
 
-### Mandatory Rules from CLAUDE.md
+### 4. CLAUDE.md Mandatory Rules
 1. Functions < 50 lines
 2. Read signatures before calling
 3. String matching: \b word boundaries only
@@ -40,478 +36,351 @@ ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-672/data/queue/: No
 
 ## Scope
 
-| Action | File | Purpose |
-|--------|------|---------|
-| CREATE | `Sources/.../Services/NotificationService.swift` | UNUserNotificationCenter wrapper for macOS notifications |
-| CREATE | `Sources/.../Services/NotificationCategory.swift` | Notification categories with approve/reject action buttons |
-| CREATE | `Sources/.../Services/NotificationDelegate.swift` | Handle user responses from notification center actions |
-| MODIFY | `Sources/.../AppState.swift` | Add escalation event storage and notification triggering |
-| MODIFY | `Sources/.../AppDelegate.swift` | Initialize notification permissions on first launch |
-| MODIFY | `Sources/.../Models/Event.swift` | Add `escalation` event type for notifications |
-| MODIFY | `Tests/.../ServiceTests.swift` | Add NotificationService, category, and delegate tests |
+| # | File | Action | Purpose |
+|---|------|--------|---------|
+| 1 | `Sources/HEIMDALLControlSurface/Services/HotkeyPreferences.swift` | CREATE | UserDefaults-backed key binding storage |
+| 2 | `Sources/HEIMDALLControlSurface/Services/HotkeyService.swift` | CREATE | Carbon API global hotkey registration service |
+| 3 | `Sources/HEIMDALLControlSurface/AppDelegate.swift` | MODIFY | Remove inline hotkey code, delegate to HotkeyService |
+| 4 | `Sources/HEIMDALLControlSurface/AppState.swift` | MODIFY | Add `approveNext()` and `rejectNext()` methods |
+| 5 | `Sources/HEIMDALLControlSurface/HeimdallApp.swift` | MODIFY | Add `wireHotkeys()` method to connect actions |
+| 6 | `Tests/HEIMDALLControlSurfaceTests/HotkeyTests.swift` | CREATE | Unit tests for hotkey configuration persistence |
 
 ---
 
-## Design
+## Data Path Trace
 
-### Architecture Overview
-
+**Hotkey Registration Flow:**
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                         AppState                             │
-│   @Published escalations: [EscalationEntry]                  │
-│   func handleEscalation(event) → triggers notification       │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   NotificationService                        │
-│   - requestAuthorization()                                   │
-│   - showEscalationNotification(escalation, issueId)          │
-│   - registerCategories()                                     │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-        ┌────────────┼────────────┐
-        ▼            ▼            ▼
-┌──────────────┐ ┌──────────────┐ ┌──────────────────────────┐
-│ Category:    │ │ Category:    │ │ NotificationDelegate     │
-│ escalation   │ │ verdict      │ │ UNUserNotificationCenter │
-│ [Approve]    │ │ [View]       │ │ Delegate                 │
-│ [Reject]     │ │              │ │ - didReceive response    │
-└──────────────┘ └──────────────┘ └──────────────────────────┘
-                                             │
-                                             ▼
-                                  ┌──────────────────────────┐
-                                  │   HeimdallAPIClient      │
-                                  │   approve() / reject()   │
-                                  └──────────────────────────┘
+AppDelegate.applicationDidFinishLaunching() → HotkeyService.init()
+    ↓
+HeimdallApp.wireHotkeys() → HotkeyService.setHandler(for:handler:) [x3]
+    ↓
+HotkeyService.registerHotkeys() → checkAccessibility() → installEventHandler()
+    ↓
+HotkeyService.registerHotkey(for:id:) → HotkeyPreferences.binding(for:)
+    ↓
+Carbon RegisterEventHotKey(keyCode, modifiers, hotkeyID, target, options, &ref)
 ```
 
-### Data Path Trace
+**Hotkey Execution Flow:**
+```
+User presses ⌃⌥⌘H/A/R → Carbon Event System
+    ↓
+hotkeyCallback() → GetEventParameter() → extract hotkeyID
+    ↓
+DispatchQueue.main.async → HotkeyService.shared?.handleHotkeyEvent(id:)
+    ↓
+HotkeyService.actionHandlers[hotkeyID]() → closure execution
+```
 
-**Escalation Event Flow:**
-1. `WebSocketService.receiveMessages()` (line 84-97) receives event
-2. `WebSocketService.parseMessage()` (line 99-109) parses to `WebSocketEvent`
-3. `ConnectionManager.handleEvent()` (line 165-167) forwards to `eventHandler`
-4. `AppState.handleEvent()` (new) filters for `.escalation` or `.verdict` with `.escalate` outcome
-5. `AppState.handleEscalation()` (new) stores escalation and calls `NotificationService.showEscalationNotification()`
-6. User clicks action button in notification
-7. `NotificationDelegate.userNotificationCenter(_:didReceive:)` (new) extracts action and issueId
-8. `HeimdallAPIClient.approve()` or `reject()` (lines 112-120) posts decision
+**Action Execution:**
+```
+⌃⌥⌘H → AppState.toggleDashboard() + NotificationCenter.post(.openDashboard) + NSApp.activate()
+⌃⌥⌘A → AppState.approveNext() → apiClient?.approve(id:) → pendingApprovals.removeFirst()
+⌃⌥⌘R → AppState.rejectNext() → apiClient?.reject(id:reason:) → pendingApprovals.removeFirst()
+```
+
+**Preferences Flow:**
+```
+HotkeyPreferences.binding(for:) → UserDefaults.data(forKey:) → JSONDecoder.decode() OR defaultBindings[action]
+HotkeyPreferences.setBinding(_:for:) → JSONEncoder.encode() → UserDefaults.set(_:forKey:)
+```
 
 ---
 
-## Implementation Details
+## Function Size Plan
 
-### 1. NotificationCategory.swift (CREATE)
+**Existing functions in files to modify (all < 50 lines):**
 
-**Purpose:** Define notification categories with action buttons.
+| File | Function | Current Lines | After Changes |
+|------|----------|---------------|---------------|
+| AppDelegate.swift | applicationDidFinishLaunching() | 7 | 8 (add setupHotkeyService call) |
+| AppDelegate.swift | applicationWillTerminate() | 2 | 4 (add hotkeyService cleanup) |
+| AppDelegate.swift | setupGlobalHotkey() | 19 | REMOVED |
+| AppDelegate.swift | cleanupHotkey() | 7 | REMOVED |
+| AppState.swift | all existing | < 15 each | unchanged |
+| HeimdallApp.swift | wireNotifications() | 11 | unchanged |
+
+**New functions (all < 50 lines):**
+
+| File | Function | Projected Lines | Status |
+|------|----------|-----------------|--------|
+| HotkeyPreferences.swift | binding(for:) | 8 | ✓ |
+| HotkeyPreferences.swift | setBinding(_:for:) | 5 | ✓ |
+| HotkeyPreferences.swift | resetToDefault(for:) | 3 | ✓ |
+| HotkeyService.swift | checkAccessibility() | 4 | ✓ |
+| HotkeyService.swift | registerHotkeys() | 6 | ✓ |
+| HotkeyService.swift | unregisterAll() | 9 | ✓ |
+| HotkeyService.swift | setHandler(for:handler:) | 4 | ✓ |
+| HotkeyService.swift | installEventHandler() | 8 | ✓ |
+| HotkeyService.swift | registerHotkey(for:id:) | 12 | ✓ |
+| HotkeyService.swift | handleHotkeyEvent(id:) | 4 | ✓ |
+| AppState.swift | approveNext() | 10 | ✓ |
+| AppState.swift | rejectNext() | 10 | ✓ |
+| HeimdallApp.swift | wireHotkeys() | 18 | ✓ |
+
+No functions exceed 50 lines. No helper extraction required.
+
+---
+
+## Detailed Design
+
+### 1. HotkeyPreferences.swift (CREATE)
+
+**Location:** `Sources/HEIMDALLControlSurface/Services/HotkeyPreferences.swift`
 
 ```swift
-// Sources/HEIMDALLControlSurface/Services/NotificationCategory.swift
-// HCS-006: Notification categories for escalation actions
-
-import UserNotifications
-
-/// Notification category identifiers
-public enum NotificationCategoryID: String {
-    case escalation = "ESCALATION"
-    case verdict = "VERDICT"
-    case error = "ERROR"
-}
-
-/// Notification action identifiers
-public enum NotificationActionID: String {
-    case approve = "APPROVE_ACTION"
-    case reject = "REJECT_ACTION"
-    case view = "VIEW_ACTION"
-    case dismiss = "DISMISS_ACTION"
-}
-
-/// Creates and registers notification categories
-public struct NotificationCategories {
-    /// Create escalation category with approve/reject buttons
-    public static func escalationCategory() -> UNNotificationCategory {
-        let approveAction = UNNotificationAction(
-            identifier: NotificationActionID.approve.rawValue,
-            title: "Approve",
-            options: [.foreground]
-        )
-        let rejectAction = UNNotificationAction(
-            identifier: NotificationActionID.reject.rawValue,
-            title: "Reject",
-            options: [.destructive, .foreground]
-        )
-        return UNNotificationCategory(
-            identifier: NotificationCategoryID.escalation.rawValue,
-            actions: [approveAction, rejectAction],
-            intentIdentifiers: [],
-            options: [.customDismissAction]
-        )
-    }
-
-    /// Create verdict category with view button
-    public static func verdictCategory() -> UNNotificationCategory {
-        let viewAction = UNNotificationAction(
-            identifier: NotificationActionID.view.rawValue,
-            title: "View Details",
-            options: [.foreground]
-        )
-        return UNNotificationCategory(
-            identifier: NotificationCategoryID.verdict.rawValue,
-            actions: [viewAction],
-            intentIdentifiers: [],
-            options: []
-        )
-    }
-
-    /// Create error category (dismiss only)
-    public static func errorCategory() -> UNNotificationCategory {
-        return UNNotificationCategory(
-            identifier: NotificationCategoryID.error.rawValue,
-            actions: [],
-            intentIdentifiers: [],
-            options: []
-        )
-    }
-
-    /// All categories for registration
-    public static func allCategories() -> Set<UNNotificationCategory> {
-        [escalationCategory(), verdictCategory(), errorCategory()]
-    }
-}
-```
-
-**Line count:** ~50 lines (struct + 4 factory methods)
-
----
-
-### 2. NotificationService.swift (CREATE)
-
-**Purpose:** UNUserNotificationCenter wrapper for scheduling notifications.
-
-```swift
-// Sources/HEIMDALLControlSurface/Services/NotificationService.swift
-// HCS-006: macOS notification service for escalation alerts
+// Sources/HEIMDALLControlSurface/Services/HotkeyPreferences.swift
+// HCS-008: UserDefaults-backed hotkey configuration
 
 import Foundation
-import UserNotifications
+import Carbon.HIToolbox
 
-/// Protocol for notification service (enables mocking)
-public protocol NotificationServiceProtocol: Sendable {
-    func requestAuthorization() async throws -> Bool
-    func showEscalationNotification(issueId: String, gate: String, reason: String) async throws
-    func showVerdictNotification(issueId: String, outcome: String, reason: String) async throws
-    func showErrorNotification(title: String, message: String) async throws
-    func registerCategories()
+/// Hotkey action identifiers
+public enum HotkeyAction: String, CaseIterable, Sendable {
+    case toggleDashboard = "toggleDashboard"
+    case approveNext = "approveNext"
+    case rejectNext = "rejectNext"
 }
 
-/// UNUserNotificationCenter-based notification service
-public final class NotificationService: NotificationServiceProtocol, @unchecked Sendable {
-    private let center: UNUserNotificationCenter
+/// Stored key binding configuration
+public struct HotkeyBinding: Codable, Sendable, Equatable {
+    public let keyCode: UInt32
+    public let modifiers: UInt32  // Carbon modifier flags
 
-    public init(center: UNUserNotificationCenter = .current()) {
-        self.center = center
+    public init(keyCode: UInt32, modifiers: UInt32) {
+        self.keyCode = keyCode
+        self.modifiers = modifiers
+    }
+}
+
+/// UserDefaults-backed preferences for hotkey bindings
+public final class HotkeyPreferences: @unchecked Sendable {
+    private let defaults: UserDefaults
+    private let keyPrefix = "com.heimdall.hcs.hotkey."
+
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
     }
 
-    /// Register notification categories on init
-    public func registerCategories() {
-        center.setNotificationCategories(NotificationCategories.allCategories())
+    /// Get binding for action (returns default if not set)
+    public func binding(for action: HotkeyAction) -> HotkeyBinding {
+        let key = keyPrefix + action.rawValue
+        if let data = defaults.data(forKey: key),
+           let binding = try? JSONDecoder().decode(HotkeyBinding.self, from: data) {
+            return binding
+        }
+        return Self.defaultBindings[action]!
     }
 
-    /// Request notification authorization
-    public func requestAuthorization() async throws -> Bool {
-        try await center.requestAuthorization(options: [.alert, .sound, .badge])
+    /// Set custom binding for action
+    public func setBinding(_ binding: HotkeyBinding, for action: HotkeyAction) {
+        let key = keyPrefix + action.rawValue
+        if let data = try? JSONEncoder().encode(binding) {
+            defaults.set(data, forKey: key)
+        }
     }
 
-    /// Show escalation notification with approve/reject actions
-    public func showEscalationNotification(
-        issueId: String,
-        gate: String,
-        reason: String
-    ) async throws {
-        let content = UNMutableNotificationContent()
-        content.title = "Escalation Required"
-        content.subtitle = "\(issueId) — \(gate) gate"
-        content.body = reason
-        content.sound = .default
-        content.categoryIdentifier = NotificationCategoryID.escalation.rawValue
-        content.userInfo = ["issueId": issueId, "gate": gate]
-
-        let request = UNNotificationRequest(
-            identifier: "escalation-\(issueId)-\(Date().timeIntervalSince1970)",
-            content: content,
-            trigger: nil  // Immediate
-        )
-        try await center.add(request)
+    /// Reset action to default binding
+    public func resetToDefault(for action: HotkeyAction) {
+        let key = keyPrefix + action.rawValue
+        defaults.removeObject(forKey: key)
     }
 
-    /// Show verdict notification with view action
-    public func showVerdictNotification(
-        issueId: String,
-        outcome: String,
-        reason: String
-    ) async throws {
-        let content = UNMutableNotificationContent()
-        content.title = "Verdict: \(outcome.capitalized)"
-        content.subtitle = issueId
-        content.body = reason
-        content.sound = .default
-        content.categoryIdentifier = NotificationCategoryID.verdict.rawValue
-        content.userInfo = ["issueId": issueId]
-
-        let request = UNNotificationRequest(
-            identifier: "verdict-\(issueId)-\(Date().timeIntervalSince1970)",
-            content: content,
-            trigger: nil
-        )
-        try await center.add(request)
-    }
-
-    /// Show error notification
-    public func showErrorNotification(title: String, message: String) async throws {
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = message
-        content.sound = .defaultCritical
-        content.categoryIdentifier = NotificationCategoryID.error.rawValue
-
-        let request = UNNotificationRequest(
-            identifier: "error-\(Date().timeIntervalSince1970)",
-            content: content,
-            trigger: nil
-        )
-        try await center.add(request)
-    }
+    /// Default hotkey bindings (⌃⌥⌘ + key)
+    public static let defaultBindings: [HotkeyAction: HotkeyBinding] = [
+        .toggleDashboard: HotkeyBinding(keyCode: 0x04, modifiers: UInt32(controlKey | optionKey | cmdKey)),  // H
+        .approveNext: HotkeyBinding(keyCode: 0x00, modifiers: UInt32(controlKey | optionKey | cmdKey)),      // A
+        .rejectNext: HotkeyBinding(keyCode: 0x0F, modifiers: UInt32(controlKey | optionKey | cmdKey))        // R
+    ]
 }
 ```
 
-**Line count:** ~75 lines total (class + 5 methods, each under 20 lines)
+**Key codes (from Carbon):**
+- H = 0x04 (kVK_ANSI_H)
+- A = 0x00 (kVK_ANSI_A)
+- R = 0x0F (kVK_ANSI_R)
+
+**Modifiers:** `controlKey | optionKey | cmdKey` = ⌃⌥⌘
 
 ---
 
-### 3. NotificationDelegate.swift (CREATE)
+### 2. HotkeyService.swift (CREATE)
 
-**Purpose:** Handle user responses from notification center.
+**Location:** `Sources/HEIMDALLControlSurface/Services/HotkeyService.swift`
 
 ```swift
-// Sources/HEIMDALLControlSurface/Services/NotificationDelegate.swift
-// HCS-006: UNUserNotificationCenter delegate for handling user actions
+// Sources/HEIMDALLControlSurface/Services/HotkeyService.swift
+// HCS-008: Carbon API global hotkey registration
 
-import Foundation
-import UserNotifications
+import AppKit
+import Carbon.HIToolbox
 
-/// Protocol for notification response handling (enables testing)
-public protocol NotificationResponseHandler: AnyObject, Sendable {
-    @MainActor func handleApprove(issueId: String) async
-    @MainActor func handleReject(issueId: String) async
-    @MainActor func handleViewIssue(issueId: String)
+/// Protocol for testability
+public protocol HotkeyServiceProtocol: Sendable {
+    func registerHotkeys()
+    func unregisterAll()
+    func setHandler(for action: HotkeyAction, handler: @escaping @Sendable () -> Void)
 }
 
-/// UNUserNotificationCenter delegate for inline action handling
+/// Global hotkey service using Carbon Event APIs
 @MainActor
-public final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
-    public weak var responseHandler: (any NotificationResponseHandler)?
+public final class HotkeyService: HotkeyServiceProtocol {
+    private let preferences: HotkeyPreferences
+    private var hotkeyRefs: [HotkeyAction: EventHotKeyRef] = [:]
+    private var eventHandler: EventHandlerRef?
+    private var actionHandlers: [UInt32: @Sendable () -> Void] = [:]
 
-    public override init() {
-        super.init()
+    /// Shared instance for C callback access
+    nonisolated(unsafe) private static var shared: HotkeyService?
+
+    public init(preferences: HotkeyPreferences = HotkeyPreferences()) {
+        self.preferences = preferences
+        Self.shared = self
     }
 
-    /// Handle user response to notification action
-    public func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        didReceive response: UNNotificationResponse,
-        withCompletionHandler completionHandler: @escaping () -> Void
-    ) {
-        let userInfo = response.notification.request.content.userInfo
-        let issueId = userInfo["issueId"] as? String ?? ""
+    /// Check and request accessibility permission
+    public func checkAccessibility() -> Bool {
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+        return AXIsProcessTrustedWithOptions(options)
+    }
 
-        Task { @MainActor in
-            await handleAction(response.actionIdentifier, issueId: issueId)
-            completionHandler()
+    /// Register all configured hotkeys
+    public func registerHotkeys() {
+        guard checkAccessibility() else { return }
+        installEventHandler()
+        for (index, action) in HotkeyAction.allCases.enumerated() {
+            registerHotkey(for: action, id: UInt32(index + 1))
         }
     }
 
-    /// Route action to appropriate handler
-    private func handleAction(_ actionId: String, issueId: String) async {
-        switch actionId {
-        case NotificationActionID.approve.rawValue:
-            await responseHandler?.handleApprove(issueId: issueId)
-        case NotificationActionID.reject.rawValue:
-            await responseHandler?.handleReject(issueId: issueId)
-        case NotificationActionID.view.rawValue:
-            responseHandler?.handleViewIssue(issueId: issueId)
-        case UNNotificationDefaultActionIdentifier:
-            // User clicked notification body — open dashboard
-            responseHandler?.handleViewIssue(issueId: issueId)
-        default:
-            break
+    /// Unregister all hotkeys and cleanup
+    public func unregisterAll() {
+        for (_, ref) in hotkeyRefs {
+            UnregisterEventHotKey(ref)
+        }
+        hotkeyRefs.removeAll()
+        if let handler = eventHandler {
+            RemoveEventHandler(handler)
+            eventHandler = nil
         }
     }
 
-    /// Handle notification presentation while app is in foreground
-    public func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        willPresent notification: UNNotification,
-        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
-    ) {
-        // Always show notifications even when app is active
-        completionHandler([.banner, .sound])
-    }
-}
-```
-
-**Line count:** ~55 lines (class + 3 methods, each under 25 lines)
-
----
-
-### 4. AppState.swift (MODIFY)
-
-**Current state:** 29 lines, simple observable with dashboard/connection state.
-
-**Changes:**
-- Add `escalations: [EscalationEntry]` property
-- Add `notificationService` dependency
-- Add `handleEscalation()` method
-- Conform to `ConnectionEventHandler` protocol
-- Conform to `NotificationResponseHandler` protocol
-
-```swift
-// Add to AppState.swift after line 17
-
-    // Pending escalations requiring user action
-    var escalations: [EscalationEntry] = []
-
-    // Notification service (injected)
-    private var notificationService: (any NotificationServiceProtocol)?
-    private var apiClient: (any HeimdallAPIClientProtocol)?
-
-    // Configure services (called from AppDelegate)
-    func configure(
-        notificationService: any NotificationServiceProtocol,
-        apiClient: any HeimdallAPIClientProtocol
-    ) {
-        self.notificationService = notificationService
-        self.apiClient = apiClient
+    /// Set handler for specific action
+    public func setHandler(for action: HotkeyAction, handler: @escaping @Sendable () -> Void) {
+        let index = HotkeyAction.allCases.firstIndex(of: action)!
+        actionHandlers[UInt32(index + 1)] = handler
     }
 
-// Add new model for escalation tracking
-public struct EscalationEntry: Identifiable, Sendable {
-    public let id: String
-    public let issueId: String
-    public let gate: String
-    public let reason: String
-    public let timestamp: Date
+    // MARK: - Private
 
-    public init(issueId: String, gate: String, reason: String, timestamp: Date = Date()) {
-        self.id = "\(issueId)-\(timestamp.timeIntervalSince1970)"
-        self.issueId = issueId
-        self.gate = gate
-        self.reason = reason
-        self.timestamp = timestamp
-    }
-}
-```
-
-**Add ConnectionEventHandler conformance:**
-```swift
-extension AppState: ConnectionEventHandler {
-    @MainActor
-    func handleEvent(_ event: WebSocketEvent) {
-        switch event.type {
-        case .verdict:
-            handleVerdictEvent(event)
-        default:
-            break
-        }
-    }
-
-    private func handleVerdictEvent(_ event: WebSocketEvent) {
-        guard let payload = try? event.verdictPayload() else { return }
-        if payload.verdict.outcome == .escalate {
-            handleEscalation(verdict: payload.verdict)
-        }
-    }
-
-    private func handleEscalation(verdict: VerdictEntry) {
-        let entry = EscalationEntry(
-            issueId: verdict.issueId,
-            gate: verdict.gate,
-            reason: verdict.reason,
-            timestamp: verdict.timestamp
+    private func installEventHandler() {
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
         )
-        escalations.append(entry)
-        Task {
-            try? await notificationService?.showEscalationNotification(
-                issueId: verdict.issueId,
-                gate: verdict.gate,
-                reason: verdict.reason
-            )
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            hotkeyCallback,
+            1, &eventType, nil, &eventHandler
+        )
+    }
+
+    private func registerHotkey(for action: HotkeyAction, id: UInt32) {
+        let binding = preferences.binding(for: action)
+        let hotkeyID = EventHotKeyID(signature: fourCharCode("HDAL"), id: id)
+        var hotKeyRef: EventHotKeyRef?
+        let status = RegisterEventHotKey(
+            binding.keyCode, binding.modifiers, hotkeyID,
+            GetApplicationEventTarget(), 0, &hotKeyRef
+        )
+        if status == noErr, let ref = hotKeyRef {
+            hotkeyRefs[action] = ref
+        }
+    }
+
+    /// Dispatch hotkey event to appropriate handler
+    fileprivate func handleHotkeyEvent(id: UInt32) {
+        if let handler = actionHandlers[id] {
+            handler()
         }
     }
 }
-```
 
-**Add NotificationResponseHandler conformance:**
-```swift
-extension AppState: NotificationResponseHandler {
-    @MainActor
-    func handleApprove(issueId: String) async {
-        do {
-            _ = try await apiClient?.approve(id: issueId)
-            escalations.removeAll { $0.issueId == issueId }
-        } catch {
-            lastError = "Approve failed: \(error.localizedDescription)"
-        }
-    }
+// MARK: - C Callback
 
-    @MainActor
-    func handleReject(issueId: String) async {
-        do {
-            _ = try await apiClient?.reject(id: issueId, reason: nil)
-            escalations.removeAll { $0.issueId == issueId }
-        } catch {
-            lastError = "Reject failed: \(error.localizedDescription)"
-        }
+private func hotkeyCallback(
+    _ nextHandler: EventHandlerCallRef?,
+    _ event: EventRef?,
+    _ userData: UnsafeMutableRawPointer?
+) -> OSStatus {
+    guard let event else { return OSStatus(eventNotHandledErr) }
+    var hotkeyID = EventHotKeyID()
+    GetEventParameter(
+        event, EventParamName(kEventParamDirectObject),
+        EventParamType(typeEventHotKeyID), nil,
+        MemoryLayout<EventHotKeyID>.size, nil, &hotkeyID
+    )
+    DispatchQueue.main.async {
+        HotkeyService.shared?.handleHotkeyEvent(id: hotkeyID.id)
     }
+    return noErr
+}
 
-    @MainActor
-    func handleViewIssue(issueId: String) {
-        selectedProjectId = issueId  // Used to navigate dashboard
-        isDashboardOpen = true
-        NotificationCenter.default.post(name: .openDashboard, object: nil)
+/// Converts 4-char string to OSType
+private func fourCharCode(_ string: String) -> OSType {
+    var result: OSType = 0
+    for char in string.utf8.prefix(4) {
+        result = (result << 8) + OSType(char)
     }
+    return result
 }
 ```
-
-**Projected line count:** ~75 lines total (original 29 + ~46 new lines split across extensions)
 
 ---
 
-### 5. AppDelegate.swift (MODIFY)
+### 3. AppDelegate.swift (MODIFY)
 
-**Current state:** 82 lines including C callback function.
+**Current state:** 102 lines with inline hotkey setup using Cmd+Shift+H.
 
 **Changes:**
-- Add `notificationDelegate` property
-- Initialize notification permissions in `applicationDidFinishLaunching`
-- Wire up NotificationDelegate to UNUserNotificationCenter
+1. Remove properties: `hotkeyRef`, `eventHandler` (lines 10-13)
+2. Remove methods: `setupGlobalHotkey()` (lines 32-52), `cleanupHotkey()` (lines 54-61)
+3. Remove top-level functions: `fourCharCode()` (lines 78-85), `hotkeyHandler()` (lines 87-98)
+4. Add property: `hotkeyService: HotkeyService?`
+5. Update `applicationDidFinishLaunching()`: remove `setupGlobalHotkey()` call, add `hotkeyService = HotkeyService()`
+6. Update `applicationWillTerminate()`: replace `cleanupHotkey()` with `hotkeyService?.unregisterAll()`
+7. Keep: `Notification.Name.openDashboard` extension (used by HeimdallApp.wireHotkeys)
 
+**After modification (approximately 50 lines):**
 ```swift
-// Add after line 12 (after eventHandler property)
+// Sources/HEIMDALLControlSurface/AppDelegate.swift
+// HCS-002: Lifecycle
+// HCS-008: HotkeyService initialization
 
-    /// Notification delegate for handling user actions
-    private var notificationDelegate: NotificationDelegate?
-    private var notificationService: NotificationService?
+import AppKit
+import UserNotifications
 
-// Add to applicationDidFinishLaunching after line 18 (after setActivationPolicy)
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Notification delegate for handling user actions (HCS-006)
+    private(set) var notificationDelegate: NotificationDelegate?
+    /// Notification service (HCS-006)
+    private(set) var notificationService: NotificationService?
+    /// Hotkey service (HCS-008)
+    private(set) var hotkeyService: HotkeyService?
 
-        // Set up notifications
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
         setupNotifications()
+        hotkeyService = HotkeyService()
+    }
 
-// Add new method after setupGlobalHotkey()
+    func applicationWillTerminate(_ notification: Notification) {
+        hotkeyService?.unregisterAll()
+    }
 
-    /// Set up notification service and request permission
+    /// Set up notification service and request permission (HCS-006)
     private func setupNotifications() {
         notificationService = NotificationService()
         notificationService?.registerCategories()
@@ -519,217 +388,316 @@ extension AppState: NotificationResponseHandler {
         notificationDelegate = NotificationDelegate()
         UNUserNotificationCenter.current().delegate = notificationDelegate
 
-        // Request permission (non-blocking)
         Task {
             _ = try? await notificationService?.requestAuthorization()
         }
     }
-```
+}
 
-**Projected line count:** ~95 lines (current 82 + 13 new lines)
-
----
-
-### 6. Event.swift (MODIFY)
-
-**Current state:** 207 lines — mostly Codable boilerplate.
-
-**Changes:** Add `escalation` event type (1 line change).
-
-```swift
-// Modify line 14 to add escalation type
-public enum EventType: String, Codable, Sendable {
-    case factoryUpdate = "factory_update"
-    case verdict = "verdict"
-    case heartbeat = "heartbeat"
-    case pipelineUpdate = "pipeline_update"
-    case agentStatus = "agent_status"
-    case escalation = "escalation"  // NEW: explicit escalation events
+extension Notification.Name {
+    static let openDashboard = Notification.Name("openDashboard")
 }
 ```
 
-**Projected line count:** 208 lines (+1 line)
+---
+
+### 4. AppState.swift (MODIFY)
+
+**Current state:** 202 lines. Add two new methods after line 128 (after `cleanupAction`).
+
+**Add after MARK: - Pending Approvals section:**
+
+```swift
+// MARK: - Global Hotkey Actions (HCS-008)
+
+/// Approve the next pending item in queue
+func approveNext() async {
+    guard let approval = pendingApprovals.first else { return }
+    do {
+        _ = try await apiClient?.approve(id: approval.id)
+        pendingApprovals.removeFirst()
+    } catch {
+        lastError = "Approve failed: \(error.localizedDescription)"
+    }
+}
+
+/// Reject the next pending item in queue
+func rejectNext() async {
+    guard let approval = pendingApprovals.first else { return }
+    do {
+        _ = try await apiClient?.reject(id: approval.id, reason: nil)
+        pendingApprovals.removeFirst()
+    } catch {
+        lastError = "Reject failed: \(error.localizedDescription)"
+    }
+}
+```
+
+**Projected line count:** 222 lines (original 202 + 20 new)
 
 ---
 
-### 7. ServiceTests.swift (MODIFY)
+### 5. HeimdallApp.swift (MODIFY)
 
-**Current state:** 350 lines.
+**Current state:** 46 lines.
 
-**Changes:** Add test suites for NotificationService, NotificationCategories, NotificationDelegate.
+**Changes:**
+1. Add `wireHotkeys()` method after `wireNotifications()`
+2. Call `wireHotkeys()` from `.onAppear` closure
+
+**Add after wireNotifications():**
+```swift
+/// Wire global hotkey handlers (HCS-008)
+private func wireHotkeys() {
+    guard let hotkeyService = appDelegate.hotkeyService else { return }
+
+    hotkeyService.setHandler(for: .toggleDashboard) { [weak appState] in
+        appState?.toggleDashboard()
+        NotificationCenter.default.post(name: .openDashboard, object: nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    hotkeyService.setHandler(for: .approveNext) { [weak appState] in
+        Task { @MainActor in await appState?.approveNext() }
+    }
+
+    hotkeyService.setHandler(for: .rejectNext) { [weak appState] in
+        Task { @MainActor in await appState?.rejectNext() }
+    }
+
+    hotkeyService.registerHotkeys()
+}
+```
+
+**Update .onAppear:**
+```swift
+.onAppear {
+    wireNotifications()
+    wireHotkeys()
+}
+```
+
+**Projected line count:** 65 lines (original 46 + 19 new)
+
+---
+
+### 6. HotkeyTests.swift (CREATE)
+
+**Location:** `Tests/HEIMDALLControlSurfaceTests/HotkeyTests.swift`
 
 ```swift
-// MARK: - Mock Notification Service
+// Tests/HEIMDALLControlSurfaceTests/HotkeyTests.swift
+// HCS-008: Hotkey configuration persistence tests
 
-final class MockNotificationService: NotificationServiceProtocol, @unchecked Sendable {
-    var authorizationRequested: Bool = false
-    var authorizationResult: Bool = true
-    var escalationNotifications: [(issueId: String, gate: String, reason: String)] = []
-    var verdictNotifications: [(issueId: String, outcome: String, reason: String)] = []
-    var errorNotifications: [(title: String, message: String)] = []
-    var categoriesRegistered: Bool = false
+import Testing
+import Foundation
+import Carbon.HIToolbox
+@testable import HEIMDALLControlSurface
 
-    func requestAuthorization() async throws -> Bool {
-        authorizationRequested = true
-        return authorizationResult
+@Suite("Hotkey Preferences Tests")
+struct HotkeyPreferencesTests {
+
+    @Test func defaultBindingsExistForAllActions() async throws {
+        let prefs = HotkeyPreferences()
+        for action in HotkeyAction.allCases {
+            let binding = prefs.binding(for: action)
+            #expect(binding.modifiers != 0)
+        }
     }
 
-    func showEscalationNotification(issueId: String, gate: String, reason: String) async throws {
-        escalationNotifications.append((issueId, gate, reason))
+    @Test func defaultToggleDashboardIsControlOptionCommandH() async throws {
+        let prefs = HotkeyPreferences()
+        let binding = prefs.binding(for: .toggleDashboard)
+        #expect(binding.keyCode == 0x04)  // H
+        let expectedMods = UInt32(controlKey | optionKey | cmdKey)
+        #expect(binding.modifiers == expectedMods)
     }
 
-    func showVerdictNotification(issueId: String, outcome: String, reason: String) async throws {
-        verdictNotifications.append((issueId, outcome, reason))
+    @Test func defaultApproveNextIsControlOptionCommandA() async throws {
+        let prefs = HotkeyPreferences()
+        let binding = prefs.binding(for: .approveNext)
+        #expect(binding.keyCode == 0x00)  // A
+        let expectedMods = UInt32(controlKey | optionKey | cmdKey)
+        #expect(binding.modifiers == expectedMods)
     }
 
-    func showErrorNotification(title: String, message: String) async throws {
-        errorNotifications.append((title, message))
+    @Test func defaultRejectNextIsControlOptionCommandR() async throws {
+        let prefs = HotkeyPreferences()
+        let binding = prefs.binding(for: .rejectNext)
+        #expect(binding.keyCode == 0x0F)  // R
+        let expectedMods = UInt32(controlKey | optionKey | cmdKey)
+        #expect(binding.modifiers == expectedMods)
     }
 
-    func registerCategories() {
-        categoriesRegistered = true
+    @Test func customBindingPersistsToUserDefaults() async throws {
+        let testDefaults = UserDefaults(suiteName: "HCS008Test")!
+        testDefaults.removePersistentDomain(forName: "HCS008Test")
+
+        let prefs = HotkeyPreferences(defaults: testDefaults)
+        let customBinding = HotkeyBinding(keyCode: 0x0D, modifiers: UInt32(cmdKey))
+
+        prefs.setBinding(customBinding, for: .toggleDashboard)
+        let retrieved = prefs.binding(for: .toggleDashboard)
+
+        #expect(retrieved == customBinding)
+        testDefaults.removePersistentDomain(forName: "HCS008Test")
+    }
+
+    @Test func resetToDefaultRemovesCustomBinding() async throws {
+        let testDefaults = UserDefaults(suiteName: "HCS008ResetTest")!
+        testDefaults.removePersistentDomain(forName: "HCS008ResetTest")
+
+        let prefs = HotkeyPreferences(defaults: testDefaults)
+        let customBinding = HotkeyBinding(keyCode: 0x0D, modifiers: UInt32(cmdKey))
+
+        prefs.setBinding(customBinding, for: .approveNext)
+        prefs.resetToDefault(for: .approveNext)
+
+        let retrieved = prefs.binding(for: .approveNext)
+        let defaultBinding = HotkeyPreferences.defaultBindings[.approveNext]!
+        #expect(retrieved == defaultBinding)
+
+        testDefaults.removePersistentDomain(forName: "HCS008ResetTest")
+    }
+
+    @Test func hotkeyBindingEquality() async throws {
+        let b1 = HotkeyBinding(keyCode: 0x04, modifiers: 123)
+        let b2 = HotkeyBinding(keyCode: 0x04, modifiers: 123)
+        let b3 = HotkeyBinding(keyCode: 0x05, modifiers: 123)
+
+        #expect(b1 == b2)
+        #expect(b1 != b3)
+    }
+
+    @Test func hotkeyActionRawValues() async throws {
+        #expect(HotkeyAction.toggleDashboard.rawValue == "toggleDashboard")
+        #expect(HotkeyAction.approveNext.rawValue == "approveNext")
+        #expect(HotkeyAction.rejectNext.rawValue == "rejectNext")
+    }
+
+    @Test func hotkeyActionAllCasesCount() async throws {
+        #expect(HotkeyAction.allCases.count == 3)
     }
 }
 
-// MARK: - Notification Category Tests
+@Suite("Hotkey Action Tests")
+struct HotkeyActionTests {
 
-@Suite("Notification Category Tests")
-struct NotificationCategoryTests {
-    @Test func escalationCategoryHasApproveRejectActions() async throws {
-        let category = NotificationCategories.escalationCategory()
-        #expect(category.identifier == "ESCALATION")
-        #expect(category.actions.count == 2)
-        let actionIds = category.actions.map { $0.identifier }
-        #expect(actionIds.contains("APPROVE_ACTION"))
-        #expect(actionIds.contains("REJECT_ACTION"))
-    }
-
-    @Test func verdictCategoryHasViewAction() async throws {
-        let category = NotificationCategories.verdictCategory()
-        #expect(category.identifier == "VERDICT")
-        #expect(category.actions.count == 1)
-        #expect(category.actions.first?.identifier == "VIEW_ACTION")
-    }
-
-    @Test func errorCategoryHasNoActions() async throws {
-        let category = NotificationCategories.errorCategory()
-        #expect(category.identifier == "ERROR")
-        #expect(category.actions.isEmpty)
-    }
-
-    @Test func allCategoriesReturnsThreeCategories() async throws {
-        let categories = NotificationCategories.allCategories()
-        #expect(categories.count == 3)
-    }
-}
-
-// MARK: - Mock Response Handler
-
-@MainActor
-final class MockResponseHandler: NotificationResponseHandler {
-    var approvedIds: [String] = []
-    var rejectedIds: [String] = []
-    var viewedIds: [String] = []
-
-    func handleApprove(issueId: String) async {
-        approvedIds.append(issueId)
-    }
-
-    func handleReject(issueId: String) async {
-        rejectedIds.append(issueId)
-    }
-
-    func handleViewIssue(issueId: String) {
-        viewedIds.append(issueId)
-    }
-}
-
-// MARK: - Notification Delegate Tests
-
-@Suite("Notification Delegate Tests")
-struct NotificationDelegateTests {
-    @Test @MainActor func delegateInitialization() async throws {
-        let delegate = NotificationDelegate()
-        #expect(delegate.responseHandler == nil)
-    }
-}
-
-// MARK: - AppState Escalation Tests
-
-@Suite("AppState Escalation Tests")
-struct AppStateEscalationTests {
-    @Test @MainActor func initialEscalationsEmpty() async throws {
+    @Test @MainActor func approveNextRemovesFirstPendingApproval() async throws {
         let appState = AppState()
-        #expect(appState.escalations.isEmpty)
+        let mockAPI = MockAPIClient()
+        let mockNotification = MockNotificationService()
+        appState.configure(notificationService: mockNotification, apiClient: mockAPI)
+
+        // Add test approvals
+        let approval = Approval(
+            id: "test-1",
+            issueId: "HCS-001",
+            phase: "review",
+            reason: "Test",
+            agent: "test-agent"
+        )
+        appState.pendingApprovals = [approval]
+
+        await appState.approveNext()
+
+        #expect(appState.pendingApprovals.isEmpty)
     }
 
-    @Test @MainActor func escalationEntryIdGeneration() async throws {
-        let entry = EscalationEntry(
-            issueId: "AASF-123",
-            gate: "review",
-            reason: "Test reason"
+    @Test @MainActor func rejectNextRemovesFirstPendingApproval() async throws {
+        let appState = AppState()
+        let mockAPI = MockAPIClient()
+        let mockNotification = MockNotificationService()
+        appState.configure(notificationService: mockNotification, apiClient: mockAPI)
+
+        let approval = Approval(
+            id: "test-2",
+            issueId: "HCS-002",
+            phase: "review",
+            reason: "Test",
+            agent: "test-agent"
         )
-        #expect(entry.issueId == "AASF-123")
-        #expect(entry.gate == "review")
-        #expect(entry.id.hasPrefix("AASF-123-"))
+        appState.pendingApprovals = [approval]
+
+        await appState.rejectNext()
+
+        #expect(appState.pendingApprovals.isEmpty)
+    }
+
+    @Test @MainActor func approveNextWithEmptyQueueDoesNothing() async throws {
+        let appState = AppState()
+        let mockAPI = MockAPIClient()
+        let mockNotification = MockNotificationService()
+        appState.configure(notificationService: mockNotification, apiClient: mockAPI)
+
+        appState.pendingApprovals = []
+
+        await appState.approveNext()
+
+        #expect(appState.lastError == nil)
     }
 }
 ```
 
-**Projected line count:** ~450 lines (current 350 + ~100 new test lines)
+---
+
+## Guard / Recovery Pairs
+
+| Guard | Location | Recovery |
+|-------|----------|----------|
+| `checkAccessibility()` returns false | HotkeyService.registerHotkeys() | Skip registration; system prompts user for permission |
+| `apiClient` is nil | AppState.approveNext() / rejectNext() | Guard returns early, no action taken |
+| `pendingApprovals.first` is nil | AppState.approveNext() / rejectNext() | Guard returns early, no action taken |
+| `RegisterEventHotKey` returns error | HotkeyService.registerHotkey() | Skip that hotkey, continue registering others |
+| JSON decode fails | HotkeyPreferences.binding(for:) | Return default binding from `defaultBindings` |
+| `hotkeyService` is nil | HeimdallApp.wireHotkeys() | Guard returns early, no wiring |
 
 ---
 
-## Function Size Plan
+## Verification Plan
 
-| File | Function | Current Lines | Projected Lines | Helper Needed |
-|------|----------|---------------|-----------------|---------------|
-| AppState.swift | handleEvent | N/A (new) | 8 | No |
-| AppState.swift | handleVerdictEvent | N/A (new) | 5 | No |
-| AppState.swift | handleEscalation | N/A (new) | 14 | No |
-| AppState.swift | handleApprove | N/A (new) | 9 | No |
-| AppState.swift | handleReject | N/A (new) | 9 | No |
-| AppDelegate.swift | setupNotifications | N/A (new) | 13 | No |
-| NotificationDelegate.swift | userNotificationCenter(didReceive:) | N/A (new) | 12 | No |
-| NotificationDelegate.swift | handleAction | N/A (new) | 15 | No |
-| NotificationService.swift | showEscalationNotification | N/A (new) | 18 | No |
-
-All functions remain under 50 lines.
+| Check | Command/Method | Expected |
+|-------|----------------|----------|
+| Build succeeds | `swift build` | Exit 0, no errors |
+| Tests pass | `swift test` | All tests green |
+| Preferences persist | Run HotkeyPreferencesTests | Custom bindings stored/retrieved correctly |
+| Default bindings correct | Run HotkeyPreferencesTests | ⌃⌥⌘H/A/R verified with correct key codes |
+| Accessibility prompt | Launch app without permission | System accessibility dialog appears |
+| Toggle dashboard | Press ⌃⌥⌘H from any app | Dashboard window toggles visibility |
+| Approve next | Press ⌃⌥⌘A with pending item | First item approved, removed from queue |
+| Reject next | Press ⌃⌥⌘R with pending item | First item rejected, removed from queue |
 
 ---
 
 ## Test Strategy
 
 ### Test Files
-- `Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift` (MODIFY)
+- `Tests/HEIMDALLControlSurfaceTests/HotkeyTests.swift` (CREATE)
 
 ### Test Cases
 
 | Suite | Test | Verification |
 |-------|------|--------------|
-| NotificationCategoryTests | escalationCategoryHasApproveRejectActions | Category has ESCALATION id and 2 actions |
-| NotificationCategoryTests | verdictCategoryHasViewAction | Category has VERDICT id and VIEW_ACTION |
-| NotificationCategoryTests | errorCategoryHasNoActions | Category has ERROR id and no actions |
-| NotificationCategoryTests | allCategoriesReturnsThreeCategories | Set contains 3 categories |
-| NotificationDelegateTests | delegateInitialization | Delegate creates with nil handler |
-| AppStateEscalationTests | initialEscalationsEmpty | AppState.escalations starts empty |
-| AppStateEscalationTests | escalationEntryIdGeneration | Entry ID contains issueId prefix |
+| HotkeyPreferencesTests | defaultBindingsExistForAllActions | All actions have non-zero modifiers |
+| HotkeyPreferencesTests | defaultToggleDashboardIsControlOptionCommandH | keyCode=0x04, mods=⌃⌥⌘ |
+| HotkeyPreferencesTests | defaultApproveNextIsControlOptionCommandA | keyCode=0x00, mods=⌃⌥⌘ |
+| HotkeyPreferencesTests | defaultRejectNextIsControlOptionCommandR | keyCode=0x0F, mods=⌃⌥⌘ |
+| HotkeyPreferencesTests | customBindingPersistsToUserDefaults | Custom binding saved and retrieved |
+| HotkeyPreferencesTests | resetToDefaultRemovesCustomBinding | Reset restores default binding |
+| HotkeyPreferencesTests | hotkeyBindingEquality | Equatable implementation correct |
+| HotkeyPreferencesTests | hotkeyActionRawValues | Raw values match expected strings |
+| HotkeyPreferencesTests | hotkeyActionAllCasesCount | Exactly 3 actions |
+| HotkeyActionTests | approveNextRemovesFirstPendingApproval | First approval removed after action |
+| HotkeyActionTests | rejectNextRemovesFirstPendingApproval | First approval removed after action |
+| HotkeyActionTests | approveNextWithEmptyQueueDoesNothing | No error when queue empty |
 
-### Verification Command
+### Verification Commands
 ```bash
-swift test --filter HEIMDALLControlSurfaceTests
+swift build
+swift test --filter HotkeyPreferencesTests
+swift test --filter HotkeyActionTests
+swift test  # All tests
 ```
-
----
-
-## Verification Plan
-
-1. **Build succeeds:** `swift build` exits 0
-2. **Tests pass:** `swift test` exits 0
-3. **Category registration:** Verify `NotificationCategories.allCategories()` returns 3 categories
-4. **Escalation handling:** Mock verdict event with `.escalate` outcome triggers notification
-5. **Action routing:** NotificationDelegate routes approve/reject to handler
-6. **Dashboard opens:** View action posts `.openDashboard` notification
 
 ---
 
@@ -737,49 +705,43 @@ swift test --filter HEIMDALLControlSurfaceTests
 
 ```json
 {
-  "issue_ref": "HCS-006",
+  "issue_ref": "HCS-008",
   "deliverables": [
     {
-      "file": "Sources/HEIMDALLControlSurface/Services/NotificationCategory.swift",
+      "file": "Sources/HEIMDALLControlSurface/Services/HotkeyPreferences.swift",
       "function": "",
-      "change_description": "CREATE: Notification categories with escalation/verdict/error identifiers and action buttons",
-      "verification": "swift build succeeds; NotificationCategories.allCategories() returns 3 categories"
+      "change_description": "CREATE new file with HotkeyAction enum, HotkeyBinding struct, HotkeyPreferences class for UserDefaults storage with default bindings for Control+Option+Command+H/A/R",
+      "verification": "swift build succeeds; HotkeyPreferencesTests pass"
     },
     {
-      "file": "Sources/HEIMDALLControlSurface/Services/NotificationService.swift",
+      "file": "Sources/HEIMDALLControlSurface/Services/HotkeyService.swift",
       "function": "",
-      "change_description": "CREATE: UNUserNotificationCenter wrapper with requestAuthorization(), showEscalationNotification(), showVerdictNotification(), showErrorNotification()",
-      "verification": "swift build succeeds; MockNotificationService can substitute in tests"
-    },
-    {
-      "file": "Sources/HEIMDALLControlSurface/Services/NotificationDelegate.swift",
-      "function": "",
-      "change_description": "CREATE: UNUserNotificationCenterDelegate with handleAction() routing to NotificationResponseHandler",
-      "verification": "swift build succeeds; delegate routes actions to handler"
-    },
-    {
-      "file": "Sources/HEIMDALLControlSurface/AppState.swift",
-      "function": "handleEvent, handleEscalation, handleApprove, handleReject, handleViewIssue",
-      "change_description": "MODIFY: Add escalations array, conform to ConnectionEventHandler and NotificationResponseHandler protocols",
-      "verification": "swift test AppStateEscalationTests pass"
+      "change_description": "CREATE new file with HotkeyServiceProtocol, HotkeyService class using Carbon RegisterEventHotKey API for global hotkey registration with accessibility check",
+      "verification": "swift build succeeds; hotkeys register when accessibility permission granted"
     },
     {
       "file": "Sources/HEIMDALLControlSurface/AppDelegate.swift",
-      "function": "setupNotifications",
-      "change_description": "MODIFY: Add setupNotifications() to applicationDidFinishLaunching, initialize NotificationService and delegate",
-      "verification": "swift build succeeds; notification permission requested on launch"
+      "function": "applicationDidFinishLaunching, applicationWillTerminate",
+      "change_description": "MODIFY to remove inline hotkey code (setupGlobalHotkey, cleanupHotkey, hotkeyHandler, fourCharCode), add hotkeyService property, initialize HotkeyService on launch, cleanup on terminate",
+      "verification": "swift build succeeds; app launches with HotkeyService initialized"
     },
     {
-      "file": "Sources/HEIMDALLControlSurface/Models/Event.swift",
-      "function": "",
-      "change_description": "MODIFY: Add .escalation case to EventType enum",
-      "verification": "EventType.escalation.rawValue == \"escalation\""
+      "file": "Sources/HEIMDALLControlSurface/AppState.swift",
+      "function": "approveNext, rejectNext",
+      "change_description": "ADD two new async methods to approve/reject first pending item in queue via apiClient",
+      "verification": "swift build succeeds; HotkeyActionTests pass"
     },
     {
-      "file": "Tests/HEIMDALLControlSurfaceTests/ServiceTests.swift",
+      "file": "Sources/HEIMDALLControlSurface/HeimdallApp.swift",
+      "function": "wireHotkeys",
+      "change_description": "ADD wireHotkeys() method to set handlers for toggleDashboard/approveNext/rejectNext actions and call registerHotkeys(); call from onAppear",
+      "verification": "swift build succeeds; hotkey handlers connected to AppState methods"
+    },
+    {
+      "file": "Tests/HEIMDALLControlSurfaceTests/HotkeyTests.swift",
       "function": "",
-      "change_description": "MODIFY: Add MockNotificationService, NotificationCategoryTests, NotificationDelegateTests, AppStateEscalationTests suites",
-      "verification": "swift test --filter HEIMDALLControlSurfaceTests passes all tests"
+      "change_description": "CREATE new test file with HotkeyPreferencesTests suite (9 tests) and HotkeyActionTests suite (3 tests) testing persistence, defaults, reset, and action execution",
+      "verification": "swift test passes all HotkeyPreferencesTests and HotkeyActionTests"
     }
   ]
 }
