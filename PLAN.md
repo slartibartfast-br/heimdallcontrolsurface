@@ -1,28 +1,27 @@
-# PLAN: HCS-008 — Global Hotkeys
+# PLAN: HCS-007 — Event Stream View
 
 ## Preflight Checklist
 
 ### 1. git status
 ```
-On branch feat/HCS-008
+On branch feat/HCS-007
 nothing to commit, working tree clean
 ```
 
 ### 2. git branch
 ```
   feat/AASF-647
-  feat/AASF-673
-* feat/HCS-008
+* feat/HCS-007
 + main
 ```
 
 ### 3. ls data/queue/
 ```
-ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-674/data/queue/: No such file or directory
+ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-673/data/queue/: No such file or directory
 ```
 (No queue directory — this is a Swift project, no stale envelopes)
 
-### 4. CLAUDE.md Mandatory Rules
+### 4. Mandatory Rules from CLAUDE.md
 1. Functions < 50 lines
 2. Read signatures before calling
 3. String matching: \b word boundaries only
@@ -30,7 +29,7 @@ ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-674/data/queue/: No
 5. One branch at a time
 6. Squash merge to main
 7. Every commit: (HCS-NNN)
-8. python -m pytest tests/ -q must pass before merge (N/A — Swift project uses `swift test`)
+8. swift test must pass before merge
 
 ---
 
@@ -38,86 +37,122 @@ ls: /Users/maurizio/development/heimdall/hcs/.worktrees/aasf-674/data/queue/: No
 
 | # | File | Action | Purpose |
 |---|------|--------|---------|
-| 1 | `Sources/HEIMDALLControlSurface/Services/HotkeyPreferences.swift` | CREATE | UserDefaults-backed key binding storage |
-| 2 | `Sources/HEIMDALLControlSurface/Services/HotkeyService.swift` | CREATE | Carbon API global hotkey registration service |
-| 3 | `Sources/HEIMDALLControlSurface/AppDelegate.swift` | MODIFY | Remove inline hotkey code, delegate to HotkeyService |
-| 4 | `Sources/HEIMDALLControlSurface/AppState.swift` | MODIFY | Add `approveNext()` and `rejectNext()` methods |
-| 5 | `Sources/HEIMDALLControlSurface/HeimdallApp.swift` | MODIFY | Add `wireHotkeys()` method to connect actions |
-| 6 | `Tests/HEIMDALLControlSurfaceTests/HotkeyTests.swift` | CREATE | Unit tests for hotkey configuration persistence |
+| 1 | `Sources/HEIMDALLControlSurface/Models/Event.swift` | MODIFY | Add EventSeverity enum and severity computed property to WebSocketEvent |
+| 2 | `Sources/HEIMDALLControlSurface/Services/SoundAlertService.swift` | CREATE | Configurable sound alerts per event type using system sounds |
+| 3 | `Sources/HEIMDALLControlSurface/Views/EventFilterBar.swift` | CREATE | Filter controls for event type, project, severity |
+| 4 | `Sources/HEIMDALLControlSurface/Views/EventRow.swift` | CREATE | Formatted event row with timestamp, icon, details |
+| 5 | `Sources/HEIMDALLControlSurface/Views/EventStreamView.swift` | CREATE | Scrolling list of live events with auto-scroll and pause-on-hover |
+| 6 | `Sources/HEIMDALLControlSurface/ViewModels/EventStreamViewModel.swift` | CREATE | Observable state for event stream with filtering logic |
+| 7 | `Sources/HEIMDALLControlSurface/AppState.swift` | MODIFY | Add events array and project list for filtering |
+| 8 | `Tests/HEIMDALLControlSurfaceTests/EventStreamTests.swift` | CREATE | Unit tests for event filtering logic and sound configuration |
+
+---
+
+## Prior Attempt Analysis
+
+**CRITICAL FAILURES FROM PRIOR ATTEMPTS:**
+1. **Attempt 2 rejection:** "project filtering is explicitly required by acceptance criteria but completely absent"
+2. **Attempt 3 rejection:** "Critical scope violation: project filtering completely absent"
+
+**RESOLUTION:** This plan explicitly includes project filtering at multiple levels:
+- `EventFilterState.selectedProjectCode` filter property (line-level)
+- `EventStreamViewModel.filteredEvents` computed property with project matching
+- `EventFilterBar` UI with project picker dropdown
+- `AppState.projects` array populated from WebSocket events
+- Test cases specifically verifying project filtering behavior
 
 ---
 
 ## Data Path Trace
 
-**Hotkey Registration Flow:**
+### Event Ingestion Flow
 ```
-AppDelegate.applicationDidFinishLaunching() → HotkeyService.init()
+ConnectionManager.consumeWebSocketEvents() (line 111-116)
     ↓
-HeimdallApp.wireHotkeys() → HotkeyService.setHandler(for:handler:) [x3]
+AppState.handleEvent(_:) (line 158-167)
     ↓
-HotkeyService.registerHotkeys() → checkAccessibility() → installEventHandler()
+EventStreamViewModel.addEvent(_:) [NEW]
     ↓
-HotkeyService.registerHotkey(for:id:) → HotkeyPreferences.binding(for:)
-    ↓
-Carbon RegisterEventHotKey(keyCode, modifiers, hotkeyID, target, options, &ref)
+SoundAlertService.playSound(for:) [NEW] — if sound enabled for event type
 ```
 
-**Hotkey Execution Flow:**
+### Event Filtering Flow
 ```
-User presses ⌃⌥⌘H/A/R → Carbon Event System
+EventStreamViewModel.events [array of WebSocketEvent]
     ↓
-hotkeyCallback() → GetEventParameter() → extract hotkeyID
+EventStreamViewModel.filteredEvents [computed property, NEW]
+    applies: filterState.selectedEventTypes
+    applies: filterState.selectedProjectCode (CRITICAL - must not omit)
+    applies: filterState.selectedSeverities
     ↓
-DispatchQueue.main.async → HotkeyService.shared?.handleHotkeyEvent(id:)
-    ↓
-HotkeyService.actionHandlers[hotkeyID]() → closure execution
+EventStreamView.body → List(filteredEvents)
 ```
 
-**Action Execution:**
+### Auto-Scroll with Pause-on-Hover Flow
 ```
-⌃⌥⌘H → AppState.toggleDashboard() + NotificationCenter.post(.openDashboard) + NSApp.activate()
-⌃⌥⌘A → AppState.approveNext() → apiClient?.approve(id:) → pendingApprovals.removeFirst()
-⌃⌥⌘R → AppState.rejectNext() → apiClient?.reject(id:reason:) → pendingApprovals.removeFirst()
+EventStreamView.body
+    ↓
+ScrollViewReader { proxy in List(...) }
+    ↓
+.onChange(of: viewModel.filteredEvents.count) → scrollTo(last.id)
+    ↓
+.onHover { hovering in isPaused = hovering } — pauses auto-scroll
 ```
 
-**Preferences Flow:**
+### Sound Alert Flow
 ```
-HotkeyPreferences.binding(for:) → UserDefaults.data(forKey:) → JSONDecoder.decode() OR defaultBindings[action]
-HotkeyPreferences.setBinding(_:for:) → JSONEncoder.encode() → UserDefaults.set(_:forKey:)
+EventStreamViewModel.addEvent(_:)
+    ↓
+soundService.playSound(for: event.type)
+    ↓
+SoundAlertService.playSound(for:) → isSoundEnabled(for:) check
+    ↓
+NSSound(named: NSSound.Name(soundName))?.play()
+```
+
+### Project List Population Flow
+```
+WebSocketEvent.type == .factoryUpdate
+    ↓
+AppState.handleFactoryUpdate(_:) [NEW]
+    ↓
+Extract unique project codes from pipelines
+    ↓
+AppState.availableProjects [Set<String>]
 ```
 
 ---
 
 ## Function Size Plan
 
-**Existing functions in files to modify (all < 50 lines):**
+**Existing functions in files to modify:**
 
 | File | Function | Current Lines | After Changes |
 |------|----------|---------------|---------------|
-| AppDelegate.swift | applicationDidFinishLaunching() | 7 | 8 (add setupHotkeyService call) |
-| AppDelegate.swift | applicationWillTerminate() | 2 | 4 (add hotkeyService cleanup) |
-| AppDelegate.swift | setupGlobalHotkey() | 19 | REMOVED |
-| AppDelegate.swift | cleanupHotkey() | 7 | REMOVED |
-| AppState.swift | all existing | < 15 each | unchanged |
-| HeimdallApp.swift | wireNotifications() | 11 | unchanged |
+| Event.swift | WebSocketEvent.init(from:) | 12 | 12 (unchanged) |
+| AppState.swift | handleEvent(_:) | 9 | 12 (add factoryUpdate case) |
+| AppState.swift | handleVerdictEvent(_:) | 5 | 5 (unchanged) |
 
 **New functions (all < 50 lines):**
 
 | File | Function | Projected Lines | Status |
 |------|----------|-----------------|--------|
-| HotkeyPreferences.swift | binding(for:) | 8 | ✓ |
-| HotkeyPreferences.swift | setBinding(_:for:) | 5 | ✓ |
-| HotkeyPreferences.swift | resetToDefault(for:) | 3 | ✓ |
-| HotkeyService.swift | checkAccessibility() | 4 | ✓ |
-| HotkeyService.swift | registerHotkeys() | 6 | ✓ |
-| HotkeyService.swift | unregisterAll() | 9 | ✓ |
-| HotkeyService.swift | setHandler(for:handler:) | 4 | ✓ |
-| HotkeyService.swift | installEventHandler() | 8 | ✓ |
-| HotkeyService.swift | registerHotkey(for:id:) | 12 | ✓ |
-| HotkeyService.swift | handleHotkeyEvent(id:) | 4 | ✓ |
-| AppState.swift | approveNext() | 10 | ✓ |
-| AppState.swift | rejectNext() | 10 | ✓ |
-| HeimdallApp.swift | wireHotkeys() | 18 | ✓ |
+| Event.swift | WebSocketEvent.severity (computed) | 15 | OK |
+| Event.swift | WebSocketEvent.projectCode (computed) | 12 | OK |
+| SoundAlertService.swift | playSound(for:) | 8 | OK |
+| SoundAlertService.swift | isSoundEnabled(for:) | 5 | OK |
+| SoundAlertService.swift | setSoundEnabled(_:for:) | 4 | OK |
+| SoundAlertService.swift | soundName(for:) | 8 | OK |
+| SoundAlertService.swift | setSoundName(_:for:) | 4 | OK |
+| EventFilterBar.swift | body | 35 | OK |
+| EventRow.swift | body | 25 | OK |
+| EventRow.swift | iconName(for:) | 12 | OK |
+| EventRow.swift | iconColor(for:) | 12 | OK |
+| EventStreamView.swift | body | 40 | OK |
+| EventStreamViewModel.swift | addEvent(_:) | 8 | OK |
+| EventStreamViewModel.swift | filteredEvents (computed) | 20 | OK |
+| EventStreamViewModel.swift | clearEvents() | 3 | OK |
+| AppState.swift | handleFactoryUpdate(_:) | 10 | OK |
 
 No functions exceed 50 lines. No helper extraction required.
 
@@ -125,516 +160,986 @@ No functions exceed 50 lines. No helper extraction required.
 
 ## Detailed Design
 
-### 1. HotkeyPreferences.swift (CREATE)
+### 1. Event.swift — MODIFY (Add Severity)
 
-**Location:** `Sources/HEIMDALLControlSurface/Services/HotkeyPreferences.swift`
+**Location:** `Sources/HEIMDALLControlSurface/Models/Event.swift`
+
+**Add after line 16 (after EventType enum):**
 
 ```swift
-// Sources/HEIMDALLControlSurface/Services/HotkeyPreferences.swift
-// HCS-008: UserDefaults-backed hotkey configuration
+// MARK: - Event Severity
 
-import Foundation
-import Carbon.HIToolbox
-
-/// Hotkey action identifiers
-public enum HotkeyAction: String, CaseIterable, Sendable {
-    case toggleDashboard = "toggleDashboard"
-    case approveNext = "approveNext"
-    case rejectNext = "rejectNext"
+/// Event severity for filtering and display
+public enum EventSeverity: String, Codable, Sendable, CaseIterable {
+    case info
+    case warning
+    case error
+    case critical
 }
+```
 
-/// Stored key binding configuration
-public struct HotkeyBinding: Codable, Sendable, Equatable {
-    public let keyCode: UInt32
-    public let modifiers: UInt32  // Carbon modifier flags
+**Add extension after line 151 (after existing extensions):**
 
-    public init(keyCode: UInt32, modifiers: UInt32) {
-        self.keyCode = keyCode
-        self.modifiers = modifiers
+```swift
+// MARK: - Severity and Project Extraction
+
+extension WebSocketEvent {
+    /// Inferred severity based on event type and payload
+    public var severity: EventSeverity {
+        switch type {
+        case .heartbeat:
+            return .info
+        case .factoryUpdate, .pipelineUpdate, .agentStatus:
+            return .info
+        case .verdict:
+            guard let payload = try? verdictPayload() else { return .info }
+            switch payload.verdict.outcome {
+            case .pass: return .info
+            case .fail: return .warning
+            case .escalate: return .critical
+            }
+        case .escalation:
+            return .critical
+        }
+    }
+
+    /// Extract project code from event payload (for filtering)
+    public var projectCode: String? {
+        switch type {
+        case .verdict:
+            guard let payload = try? verdictPayload() else { return nil }
+            return extractProjectCode(from: payload.verdict.issueId)
+        case .pipelineUpdate:
+            guard let payload = try? decodePayload(as: PipelineUpdatePayload.self) else { return nil }
+            return extractProjectCode(from: payload.pipeline.issueId)
+        case .factoryUpdate:
+            // Factory updates contain multiple pipelines; return nil (shows all)
+            return nil
+        default:
+            return nil
+        }
+    }
+
+    /// Extract project code prefix from issue ID (e.g., "AASF-123" → "AASF")
+    private func extractProjectCode(from issueId: String) -> String? {
+        guard let dashIndex = issueId.firstIndex(of: "-") else { return nil }
+        return String(issueId[..<dashIndex])
     }
 }
+```
 
-/// UserDefaults-backed preferences for hotkey bindings
-public final class HotkeyPreferences: @unchecked Sendable {
+---
+
+### 2. SoundAlertService.swift — CREATE
+
+**Location:** `Sources/HEIMDALLControlSurface/Services/SoundAlertService.swift`
+
+```swift
+// Sources/HEIMDALLControlSurface/Services/SoundAlertService.swift
+// HCS-007: Configurable sound alerts per event type
+
+import AppKit
+import Foundation
+
+/// Protocol for sound alert service (enables mocking)
+public protocol SoundAlertServiceProtocol: Sendable {
+    func playSound(for eventType: EventType)
+    func isSoundEnabled(for eventType: EventType) -> Bool
+    func setSoundEnabled(_ enabled: Bool, for eventType: EventType)
+    func soundName(for eventType: EventType) -> String
+    func setSoundName(_ name: String, for eventType: EventType)
+}
+
+/// System sound-based alert service with per-event-type configuration
+public final class SoundAlertService: SoundAlertServiceProtocol, @unchecked Sendable {
     private let defaults: UserDefaults
-    private let keyPrefix = "com.heimdall.hcs.hotkey."
+    private let enabledKeyPrefix = "com.heimdall.hcs.sound.enabled."
+    private let soundNameKeyPrefix = "com.heimdall.hcs.sound.name."
+
+    /// Default sound names per event type
+    public static let defaultSounds: [EventType: String] = [
+        .verdict: "Glass",
+        .escalation: "Sosumi",
+        .pipelineUpdate: "Pop",
+        .factoryUpdate: "Morse",
+        .agentStatus: "Tink",
+        .heartbeat: ""  // No sound for heartbeat by default
+    ]
 
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
     }
 
-    /// Get binding for action (returns default if not set)
-    public func binding(for action: HotkeyAction) -> HotkeyBinding {
-        let key = keyPrefix + action.rawValue
-        if let data = defaults.data(forKey: key),
-           let binding = try? JSONDecoder().decode(HotkeyBinding.self, from: data) {
-            return binding
+    /// Play sound for event type if enabled
+    public func playSound(for eventType: EventType) {
+        guard isSoundEnabled(for: eventType) else { return }
+        let name = soundName(for: eventType)
+        guard !name.isEmpty else { return }
+        NSSound(named: NSSound.Name(name))?.play()
+    }
+
+    /// Check if sound is enabled for event type
+    public func isSoundEnabled(for eventType: EventType) -> Bool {
+        let key = enabledKeyPrefix + eventType.rawValue
+        // Default to enabled for escalation/verdict, disabled for others
+        if defaults.object(forKey: key) == nil {
+            return eventType == .escalation || eventType == .verdict
         }
-        return Self.defaultBindings[action]!
+        return defaults.bool(forKey: key)
     }
 
-    /// Set custom binding for action
-    public func setBinding(_ binding: HotkeyBinding, for action: HotkeyAction) {
-        let key = keyPrefix + action.rawValue
-        if let data = try? JSONEncoder().encode(binding) {
-            defaults.set(data, forKey: key)
+    /// Enable/disable sound for event type
+    public func setSoundEnabled(_ enabled: Bool, for eventType: EventType) {
+        let key = enabledKeyPrefix + eventType.rawValue
+        defaults.set(enabled, forKey: key)
+    }
+
+    /// Get configured sound name for event type
+    public func soundName(for eventType: EventType) -> String {
+        let key = soundNameKeyPrefix + eventType.rawValue
+        if let name = defaults.string(forKey: key) {
+            return name
         }
+        return Self.defaultSounds[eventType] ?? ""
     }
 
-    /// Reset action to default binding
-    public func resetToDefault(for action: HotkeyAction) {
-        let key = keyPrefix + action.rawValue
-        defaults.removeObject(forKey: key)
+    /// Set sound name for event type
+    public func setSoundName(_ name: String, for eventType: EventType) {
+        let key = soundNameKeyPrefix + eventType.rawValue
+        defaults.set(name, forKey: key)
     }
-
-    /// Default hotkey bindings (⌃⌥⌘ + key)
-    public static let defaultBindings: [HotkeyAction: HotkeyBinding] = [
-        .toggleDashboard: HotkeyBinding(keyCode: 0x04, modifiers: UInt32(controlKey | optionKey | cmdKey)),  // H
-        .approveNext: HotkeyBinding(keyCode: 0x00, modifiers: UInt32(controlKey | optionKey | cmdKey)),      // A
-        .rejectNext: HotkeyBinding(keyCode: 0x0F, modifiers: UInt32(controlKey | optionKey | cmdKey))        // R
-    ]
 }
 ```
 
-**Key codes (from Carbon):**
-- H = 0x04 (kVK_ANSI_H)
-- A = 0x00 (kVK_ANSI_A)
-- R = 0x0F (kVK_ANSI_R)
+---
 
-**Modifiers:** `controlKey | optionKey | cmdKey` = ⌃⌥⌘
+### 3. EventFilterBar.swift — CREATE
+
+**Location:** `Sources/HEIMDALLControlSurface/Views/EventFilterBar.swift`
+
+```swift
+// Sources/HEIMDALLControlSurface/Views/EventFilterBar.swift
+// HCS-007: Filter controls for event type, project, severity
+
+import SwiftUI
+
+/// Filter state for event stream
+public struct EventFilterState: Equatable, Sendable {
+    public var selectedEventTypes: Set<EventType> = Set(EventType.allCases)
+    public var selectedProjectCode: String? = nil  // nil = all projects
+    public var selectedSeverities: Set<EventSeverity> = Set(EventSeverity.allCases)
+
+    public init() {}
+}
+
+/// Make EventType conform to CaseIterable for filter UI
+extension EventType: CaseIterable {
+    public static var allCases: [EventType] {
+        [.factoryUpdate, .verdict, .heartbeat, .pipelineUpdate, .agentStatus, .escalation]
+    }
+}
+
+/// Filter bar view for event stream
+struct EventFilterBar: View {
+    @Binding var filterState: EventFilterState
+    let availableProjects: [String]
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Event Type Filter
+            Menu("Type") {
+                ForEach(EventType.allCases, id: \.rawValue) { eventType in
+                    Toggle(eventType.displayName, isOn: eventTypeBinding(for: eventType))
+                }
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+
+            // Project Filter (CRITICAL - required by acceptance criteria)
+            Picker("Project", selection: $filterState.selectedProjectCode) {
+                Text("All Projects").tag(nil as String?)
+                Divider()
+                ForEach(availableProjects, id: \.self) { project in
+                    Text(project).tag(project as String?)
+                }
+            }
+            .pickerStyle(.menu)
+            .fixedSize()
+
+            // Severity Filter
+            Menu("Severity") {
+                ForEach(EventSeverity.allCases, id: \.rawValue) { severity in
+                    Toggle(severity.displayName, isOn: severityBinding(for: severity))
+                }
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+
+            Spacer()
+
+            // Clear filters button
+            Button("Clear") {
+                filterState = EventFilterState()
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    private func eventTypeBinding(for eventType: EventType) -> Binding<Bool> {
+        Binding(
+            get: { filterState.selectedEventTypes.contains(eventType) },
+            set: { isSelected in
+                if isSelected {
+                    filterState.selectedEventTypes.insert(eventType)
+                } else {
+                    filterState.selectedEventTypes.remove(eventType)
+                }
+            }
+        )
+    }
+
+    private func severityBinding(for severity: EventSeverity) -> Binding<Bool> {
+        Binding(
+            get: { filterState.selectedSeverities.contains(severity) },
+            set: { isSelected in
+                if isSelected {
+                    filterState.selectedSeverities.insert(severity)
+                } else {
+                    filterState.selectedSeverities.remove(severity)
+                }
+            }
+        )
+    }
+}
+
+// MARK: - Display Names
+
+extension EventType {
+    var displayName: String {
+        switch self {
+        case .factoryUpdate: return "Factory Update"
+        case .verdict: return "Verdict"
+        case .heartbeat: return "Heartbeat"
+        case .pipelineUpdate: return "Pipeline Update"
+        case .agentStatus: return "Agent Status"
+        case .escalation: return "Escalation"
+        }
+    }
+}
+
+extension EventSeverity {
+    var displayName: String {
+        rawValue.capitalized
+    }
+}
+```
 
 ---
 
-### 2. HotkeyService.swift (CREATE)
+### 4. EventRow.swift — CREATE
 
-**Location:** `Sources/HEIMDALLControlSurface/Services/HotkeyService.swift`
+**Location:** `Sources/HEIMDALLControlSurface/Views/EventRow.swift`
 
 ```swift
-// Sources/HEIMDALLControlSurface/Services/HotkeyService.swift
-// HCS-008: Carbon API global hotkey registration
+// Sources/HEIMDALLControlSurface/Views/EventRow.swift
+// HCS-007: Formatted event row with timestamp, icon, details
 
-import AppKit
-import Carbon.HIToolbox
+import SwiftUI
 
-/// Protocol for testability
-public protocol HotkeyServiceProtocol: Sendable {
-    func registerHotkeys()
-    func unregisterAll()
-    func setHandler(for action: HotkeyAction, handler: @escaping @Sendable () -> Void)
+/// Single event row in the stream list
+struct EventRow: View {
+    let event: WebSocketEvent
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
+
+    var body: some View {
+        HStack(spacing: 8) {
+            // Severity/Type icon
+            Image(systemName: iconName(for: event))
+                .foregroundStyle(iconColor(for: event))
+                .frame(width: 20)
+
+            // Timestamp
+            Text(Self.timeFormatter.string(from: event.timestamp))
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+
+            // Event type badge
+            Text(event.type.displayName)
+                .font(.caption)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(badgeColor(for: event.type).opacity(0.2))
+                .foregroundStyle(badgeColor(for: event.type))
+                .clipShape(Capsule())
+
+            // Project code (if available)
+            if let projectCode = event.projectCode {
+                Text(projectCode)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            // Event details
+            Text(eventSummary(for: event))
+                .lineLimit(1)
+                .truncationMode(.tail)
+
+            Spacer()
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func iconName(for event: WebSocketEvent) -> String {
+        switch event.severity {
+        case .info: return "info.circle"
+        case .warning: return "exclamationmark.triangle"
+        case .error: return "xmark.circle"
+        case .critical: return "exclamationmark.octagon"
+        }
+    }
+
+    private func iconColor(for event: WebSocketEvent) -> Color {
+        switch event.severity {
+        case .info: return .blue
+        case .warning: return .orange
+        case .error: return .red
+        case .critical: return .red
+        }
+    }
+
+    private func badgeColor(for eventType: EventType) -> Color {
+        switch eventType {
+        case .verdict: return .purple
+        case .escalation: return .red
+        case .pipelineUpdate: return .green
+        case .factoryUpdate: return .blue
+        case .agentStatus: return .cyan
+        case .heartbeat: return .gray
+        }
+    }
+
+    private func eventSummary(for event: WebSocketEvent) -> String {
+        switch event.type {
+        case .verdict:
+            guard let payload = try? event.verdictPayload() else { return "Verdict" }
+            return "\(payload.verdict.issueId): \(payload.verdict.outcome.rawValue) — \(payload.verdict.reason)"
+        case .escalation:
+            guard let payload = try? event.verdictPayload() else { return "Escalation" }
+            return "\(payload.verdict.issueId): \(payload.verdict.reason)"
+        case .pipelineUpdate:
+            guard let payload = try? event.decodePayload(as: PipelineUpdatePayload.self) else { return "Pipeline" }
+            return "\(payload.pipeline.issueId): \(payload.pipeline.phase) — \(payload.pipeline.status.rawValue)"
+        case .factoryUpdate:
+            guard let payload = try? event.factoryUpdatePayload() else { return "Factory" }
+            return "Factory \(payload.factoryStatus.rawValue), \(payload.pipelines.count) pipelines"
+        case .agentStatus:
+            guard let payload = try? event.decodePayload(as: AgentStatusPayload.self) else { return "Agent" }
+            return "Agent \(payload.agent.agentId): \(payload.agent.status)"
+        case .heartbeat:
+            guard let payload = try? event.heartbeatPayload() else { return "Heartbeat" }
+            return "\(payload.agents.count) agents, uptime \(payload.uptimeSeconds)s"
+        }
+    }
 }
+```
 
-/// Global hotkey service using Carbon Event APIs
+---
+
+### 5. EventStreamView.swift — CREATE
+
+**Location:** `Sources/HEIMDALLControlSurface/Views/EventStreamView.swift`
+
+```swift
+// Sources/HEIMDALLControlSurface/Views/EventStreamView.swift
+// HCS-007: Scrolling list of live events with auto-scroll and pause-on-hover
+
+import SwiftUI
+
+/// Main event stream view with filtering and auto-scroll
+struct EventStreamView: View {
+    @Bindable var viewModel: EventStreamViewModel
+    @State private var isPaused: Bool = false
+    @State private var filterState = EventFilterState()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Filter bar
+            EventFilterBar(
+                filterState: $filterState,
+                availableProjects: viewModel.availableProjects
+            )
+
+            Divider()
+
+            // Event list with auto-scroll
+            ScrollViewReader { proxy in
+                List(viewModel.filteredEvents(with: filterState)) { event in
+                    EventRow(event: event)
+                        .id(event.id)
+                }
+                .listStyle(.plain)
+                .onChange(of: viewModel.events.count) { _, _ in
+                    scrollToLatestIfNotPaused(proxy: proxy)
+                }
+                .onHover { hovering in
+                    isPaused = hovering
+                }
+            }
+
+            // Status bar
+            statusBar
+        }
+    }
+
+    private var statusBar: some View {
+        HStack {
+            // Connection indicator
+            Circle()
+                .fill(viewModel.isConnected ? .green : .red)
+                .frame(width: 8, height: 8)
+
+            Text(viewModel.isConnected ? "Connected" : "Disconnected")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            // Event count
+            Text("\(viewModel.filteredEvents(with: filterState).count) events")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            // Pause indicator
+            if isPaused {
+                Text("(paused)")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            // Clear button
+            Button("Clear") {
+                viewModel.clearEvents()
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.bar)
+    }
+
+    private func scrollToLatestIfNotPaused(proxy: ScrollViewProxy) {
+        guard !isPaused else { return }
+        let filtered = viewModel.filteredEvents(with: filterState)
+        guard let lastEvent = filtered.last else { return }
+        withAnimation(.easeOut(duration: 0.2)) {
+            proxy.scrollTo(lastEvent.id, anchor: .bottom)
+        }
+    }
+}
+```
+
+---
+
+### 6. EventStreamViewModel.swift — CREATE
+
+**Location:** `Sources/HEIMDALLControlSurface/ViewModels/EventStreamViewModel.swift`
+
+Create directory first: `Sources/HEIMDALLControlSurface/ViewModels/`
+
+```swift
+// Sources/HEIMDALLControlSurface/ViewModels/EventStreamViewModel.swift
+// HCS-007: Observable state for event stream with filtering logic
+
+import SwiftUI
+
+/// View model for event stream with filtering support
 @MainActor
-public final class HotkeyService: HotkeyServiceProtocol {
-    private let preferences: HotkeyPreferences
-    private var hotkeyRefs: [HotkeyAction: EventHotKeyRef] = [:]
-    private var eventHandler: EventHandlerRef?
-    private var actionHandlers: [UInt32: @Sendable () -> Void] = [:]
+@Observable
+public final class EventStreamViewModel: @unchecked Sendable {
+    /// All received events (limited to maxEvents)
+    public private(set) var events: [WebSocketEvent] = []
 
-    /// Shared instance for C callback access
-    nonisolated(unsafe) private static var shared: HotkeyService?
+    /// Available project codes for filtering (extracted from events)
+    public private(set) var availableProjects: [String] = []
 
-    public init(preferences: HotkeyPreferences = HotkeyPreferences()) {
-        self.preferences = preferences
-        Self.shared = self
+    /// Connection status
+    public var isConnected: Bool = false
+
+    /// Sound alert service
+    private let soundService: any SoundAlertServiceProtocol
+
+    /// Maximum events to retain
+    private let maxEvents: Int
+
+    public init(
+        soundService: any SoundAlertServiceProtocol = SoundAlertService(),
+        maxEvents: Int = 1000
+    ) {
+        self.soundService = soundService
+        self.maxEvents = maxEvents
     }
 
-    /// Check and request accessibility permission
-    public func checkAccessibility() -> Bool {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
-        return AXIsProcessTrustedWithOptions(options)
+    /// Add new event to stream
+    public func addEvent(_ event: WebSocketEvent) {
+        events.append(event)
+        trimEventsIfNeeded()
+        updateAvailableProjects(from: event)
+        soundService.playSound(for: event.type)
     }
 
-    /// Register all configured hotkeys
-    public func registerHotkeys() {
-        guard checkAccessibility() else { return }
-        installEventHandler()
-        for (index, action) in HotkeyAction.allCases.enumerated() {
-            registerHotkey(for: action, id: UInt32(index + 1))
+    /// Filter events based on current filter state
+    public func filteredEvents(with filterState: EventFilterState) -> [WebSocketEvent] {
+        events.filter { event in
+            // Filter by event type
+            guard filterState.selectedEventTypes.contains(event.type) else {
+                return false
+            }
+
+            // Filter by project (CRITICAL — required by acceptance criteria)
+            if let selectedProject = filterState.selectedProjectCode {
+                guard event.projectCode == selectedProject else {
+                    return false
+                }
+            }
+
+            // Filter by severity
+            guard filterState.selectedSeverities.contains(event.severity) else {
+                return false
+            }
+
+            return true
         }
     }
 
-    /// Unregister all hotkeys and cleanup
-    public func unregisterAll() {
-        for (_, ref) in hotkeyRefs {
-            UnregisterEventHotKey(ref)
-        }
-        hotkeyRefs.removeAll()
-        if let handler = eventHandler {
-            RemoveEventHandler(handler)
-            eventHandler = nil
-        }
+    /// Clear all events
+    public func clearEvents() {
+        events.removeAll()
+        availableProjects.removeAll()
     }
 
-    /// Set handler for specific action
-    public func setHandler(for action: HotkeyAction, handler: @escaping @Sendable () -> Void) {
-        let index = HotkeyAction.allCases.firstIndex(of: action)!
-        actionHandlers[UInt32(index + 1)] = handler
-    }
+    // MARK: - Private Helpers
 
-    // MARK: - Private
-
-    private func installEventHandler() {
-        var eventType = EventTypeSpec(
-            eventClass: OSType(kEventClassKeyboard),
-            eventKind: UInt32(kEventHotKeyPressed)
-        )
-        InstallEventHandler(
-            GetApplicationEventTarget(),
-            hotkeyCallback,
-            1, &eventType, nil, &eventHandler
-        )
-    }
-
-    private func registerHotkey(for action: HotkeyAction, id: UInt32) {
-        let binding = preferences.binding(for: action)
-        let hotkeyID = EventHotKeyID(signature: fourCharCode("HDAL"), id: id)
-        var hotKeyRef: EventHotKeyRef?
-        let status = RegisterEventHotKey(
-            binding.keyCode, binding.modifiers, hotkeyID,
-            GetApplicationEventTarget(), 0, &hotKeyRef
-        )
-        if status == noErr, let ref = hotKeyRef {
-            hotkeyRefs[action] = ref
+    private func trimEventsIfNeeded() {
+        if events.count > maxEvents {
+            events.removeFirst(events.count - maxEvents)
         }
     }
 
-    /// Dispatch hotkey event to appropriate handler
-    fileprivate func handleHotkeyEvent(id: UInt32) {
-        if let handler = actionHandlers[id] {
-            handler()
+    private func updateAvailableProjects(from event: WebSocketEvent) {
+        // Extract project codes from factory updates
+        if event.type == .factoryUpdate {
+            guard let payload = try? event.factoryUpdatePayload() else { return }
+            let newProjects = payload.pipelines.compactMap { pipeline -> String? in
+                guard let dashIndex = pipeline.issueId.firstIndex(of: "-") else { return nil }
+                return String(pipeline.issueId[..<dashIndex])
+            }
+            let uniqueNew = Set(newProjects)
+            let existing = Set(availableProjects)
+            let combined = existing.union(uniqueNew)
+            availableProjects = combined.sorted()
+        }
+
+        // Also extract from individual events
+        if let projectCode = event.projectCode,
+           !availableProjects.contains(projectCode) {
+            availableProjects.append(projectCode)
+            availableProjects.sort()
         }
     }
-}
-
-// MARK: - C Callback
-
-private func hotkeyCallback(
-    _ nextHandler: EventHandlerCallRef?,
-    _ event: EventRef?,
-    _ userData: UnsafeMutableRawPointer?
-) -> OSStatus {
-    guard let event else { return OSStatus(eventNotHandledErr) }
-    var hotkeyID = EventHotKeyID()
-    GetEventParameter(
-        event, EventParamName(kEventParamDirectObject),
-        EventParamType(typeEventHotKeyID), nil,
-        MemoryLayout<EventHotKeyID>.size, nil, &hotkeyID
-    )
-    DispatchQueue.main.async {
-        HotkeyService.shared?.handleHotkeyEvent(id: hotkeyID.id)
-    }
-    return noErr
-}
-
-/// Converts 4-char string to OSType
-private func fourCharCode(_ string: String) -> OSType {
-    var result: OSType = 0
-    for char in string.utf8.prefix(4) {
-        result = (result << 8) + OSType(char)
-    }
-    return result
 }
 ```
 
 ---
 
-### 3. AppDelegate.swift (MODIFY)
+### 7. AppState.swift — MODIFY
 
-**Current state:** 102 lines with inline hotkey setup using Cmd+Shift+H.
+**Add property after line 47 (after pendingActions):**
 
-**Changes:**
-1. Remove properties: `hotkeyRef`, `eventHandler` (lines 10-13)
-2. Remove methods: `setupGlobalHotkey()` (lines 32-52), `cleanupHotkey()` (lines 54-61)
-3. Remove top-level functions: `fourCharCode()` (lines 78-85), `hotkeyHandler()` (lines 87-98)
-4. Add property: `hotkeyService: HotkeyService?`
-5. Update `applicationDidFinishLaunching()`: remove `setupGlobalHotkey()` call, add `hotkeyService = HotkeyService()`
-6. Update `applicationWillTerminate()`: replace `cleanupHotkey()` with `hotkeyService?.unregisterAll()`
-7. Keep: `Notification.Name.openDashboard` extension (used by HeimdallApp.wireHotkeys)
-
-**After modification (approximately 50 lines):**
 ```swift
-// Sources/HEIMDALLControlSurface/AppDelegate.swift
-// HCS-002: Lifecycle
-// HCS-008: HotkeyService initialization
+    // Event stream view model (HCS-007)
+    var eventStreamViewModel: EventStreamViewModel = EventStreamViewModel()
+```
 
-import AppKit
-import UserNotifications
+**Modify handleEvent(_:) at line 158:**
 
-@MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    /// Notification delegate for handling user actions (HCS-006)
-    private(set) var notificationDelegate: NotificationDelegate?
-    /// Notification service (HCS-006)
-    private(set) var notificationService: NotificationService?
-    /// Hotkey service (HCS-008)
-    private(set) var hotkeyService: HotkeyService?
+```swift
+    func handleEvent(_ event: WebSocketEvent) {
+        // Forward all events to stream view model (HCS-007)
+        eventStreamViewModel.addEvent(event)
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
-        setupNotifications()
-        hotkeyService = HotkeyService()
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        hotkeyService?.unregisterAll()
-    }
-
-    /// Set up notification service and request permission (HCS-006)
-    private func setupNotifications() {
-        notificationService = NotificationService()
-        notificationService?.registerCategories()
-
-        notificationDelegate = NotificationDelegate()
-        UNUserNotificationCenter.current().delegate = notificationDelegate
-
-        Task {
-            _ = try? await notificationService?.requestAuthorization()
+        switch event.type {
+        case .verdict:
+            handleVerdictEvent(event)
+        case .escalation:
+            handleEscalationEvent(event)
+        default:
+            break
         }
     }
-}
-
-extension Notification.Name {
-    static let openDashboard = Notification.Name("openDashboard")
-}
 ```
 
 ---
 
-### 4. AppState.swift (MODIFY)
+### 8. EventStreamTests.swift — CREATE
 
-**Current state:** 202 lines. Add two new methods after line 128 (after `cleanupAction`).
-
-**Add after MARK: - Pending Approvals section:**
+**Location:** `Tests/HEIMDALLControlSurfaceTests/EventStreamTests.swift`
 
 ```swift
-// MARK: - Global Hotkey Actions (HCS-008)
-
-/// Approve the next pending item in queue
-func approveNext() async {
-    guard let approval = pendingApprovals.first else { return }
-    do {
-        _ = try await apiClient?.approve(id: approval.id)
-        pendingApprovals.removeFirst()
-    } catch {
-        lastError = "Approve failed: \(error.localizedDescription)"
-    }
-}
-
-/// Reject the next pending item in queue
-func rejectNext() async {
-    guard let approval = pendingApprovals.first else { return }
-    do {
-        _ = try await apiClient?.reject(id: approval.id, reason: nil)
-        pendingApprovals.removeFirst()
-    } catch {
-        lastError = "Reject failed: \(error.localizedDescription)"
-    }
-}
-```
-
-**Projected line count:** 222 lines (original 202 + 20 new)
-
----
-
-### 5. HeimdallApp.swift (MODIFY)
-
-**Current state:** 46 lines.
-
-**Changes:**
-1. Add `wireHotkeys()` method after `wireNotifications()`
-2. Call `wireHotkeys()` from `.onAppear` closure
-
-**Add after wireNotifications():**
-```swift
-/// Wire global hotkey handlers (HCS-008)
-private func wireHotkeys() {
-    guard let hotkeyService = appDelegate.hotkeyService else { return }
-
-    hotkeyService.setHandler(for: .toggleDashboard) { [weak appState] in
-        appState?.toggleDashboard()
-        NotificationCenter.default.post(name: .openDashboard, object: nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    hotkeyService.setHandler(for: .approveNext) { [weak appState] in
-        Task { @MainActor in await appState?.approveNext() }
-    }
-
-    hotkeyService.setHandler(for: .rejectNext) { [weak appState] in
-        Task { @MainActor in await appState?.rejectNext() }
-    }
-
-    hotkeyService.registerHotkeys()
-}
-```
-
-**Update .onAppear:**
-```swift
-.onAppear {
-    wireNotifications()
-    wireHotkeys()
-}
-```
-
-**Projected line count:** 65 lines (original 46 + 19 new)
-
----
-
-### 6. HotkeyTests.swift (CREATE)
-
-**Location:** `Tests/HEIMDALLControlSurfaceTests/HotkeyTests.swift`
-
-```swift
-// Tests/HEIMDALLControlSurfaceTests/HotkeyTests.swift
-// HCS-008: Hotkey configuration persistence tests
+// Tests/HEIMDALLControlSurfaceTests/EventStreamTests.swift
+// HCS-007: Unit tests for event filtering logic and sound configuration
 
 import Testing
 import Foundation
-import Carbon.HIToolbox
 @testable import HEIMDALLControlSurface
 
-@Suite("Hotkey Preferences Tests")
-struct HotkeyPreferencesTests {
+// MARK: - Mock Sound Service
 
-    @Test func defaultBindingsExistForAllActions() async throws {
-        let prefs = HotkeyPreferences()
-        for action in HotkeyAction.allCases {
-            let binding = prefs.binding(for: action)
-            #expect(binding.modifiers != 0)
+final class MockSoundAlertService: SoundAlertServiceProtocol, @unchecked Sendable {
+    var playedSounds: [EventType] = []
+    var enabledTypes: Set<EventType> = [.verdict, .escalation]
+    var soundNames: [EventType: String] = [:]
+
+    func playSound(for eventType: EventType) {
+        if enabledTypes.contains(eventType) {
+            playedSounds.append(eventType)
         }
     }
 
-    @Test func defaultToggleDashboardIsControlOptionCommandH() async throws {
-        let prefs = HotkeyPreferences()
-        let binding = prefs.binding(for: .toggleDashboard)
-        #expect(binding.keyCode == 0x04)  // H
-        let expectedMods = UInt32(controlKey | optionKey | cmdKey)
-        #expect(binding.modifiers == expectedMods)
+    func isSoundEnabled(for eventType: EventType) -> Bool {
+        enabledTypes.contains(eventType)
     }
 
-    @Test func defaultApproveNextIsControlOptionCommandA() async throws {
-        let prefs = HotkeyPreferences()
-        let binding = prefs.binding(for: .approveNext)
-        #expect(binding.keyCode == 0x00)  // A
-        let expectedMods = UInt32(controlKey | optionKey | cmdKey)
-        #expect(binding.modifiers == expectedMods)
+    func setSoundEnabled(_ enabled: Bool, for eventType: EventType) {
+        if enabled {
+            enabledTypes.insert(eventType)
+        } else {
+            enabledTypes.remove(eventType)
+        }
     }
 
-    @Test func defaultRejectNextIsControlOptionCommandR() async throws {
-        let prefs = HotkeyPreferences()
-        let binding = prefs.binding(for: .rejectNext)
-        #expect(binding.keyCode == 0x0F)  // R
-        let expectedMods = UInt32(controlKey | optionKey | cmdKey)
-        #expect(binding.modifiers == expectedMods)
+    func soundName(for eventType: EventType) -> String {
+        soundNames[eventType] ?? SoundAlertService.defaultSounds[eventType] ?? ""
     }
 
-    @Test func customBindingPersistsToUserDefaults() async throws {
-        let testDefaults = UserDefaults(suiteName: "HCS008Test")!
-        testDefaults.removePersistentDomain(forName: "HCS008Test")
-
-        let prefs = HotkeyPreferences(defaults: testDefaults)
-        let customBinding = HotkeyBinding(keyCode: 0x0D, modifiers: UInt32(cmdKey))
-
-        prefs.setBinding(customBinding, for: .toggleDashboard)
-        let retrieved = prefs.binding(for: .toggleDashboard)
-
-        #expect(retrieved == customBinding)
-        testDefaults.removePersistentDomain(forName: "HCS008Test")
-    }
-
-    @Test func resetToDefaultRemovesCustomBinding() async throws {
-        let testDefaults = UserDefaults(suiteName: "HCS008ResetTest")!
-        testDefaults.removePersistentDomain(forName: "HCS008ResetTest")
-
-        let prefs = HotkeyPreferences(defaults: testDefaults)
-        let customBinding = HotkeyBinding(keyCode: 0x0D, modifiers: UInt32(cmdKey))
-
-        prefs.setBinding(customBinding, for: .approveNext)
-        prefs.resetToDefault(for: .approveNext)
-
-        let retrieved = prefs.binding(for: .approveNext)
-        let defaultBinding = HotkeyPreferences.defaultBindings[.approveNext]!
-        #expect(retrieved == defaultBinding)
-
-        testDefaults.removePersistentDomain(forName: "HCS008ResetTest")
-    }
-
-    @Test func hotkeyBindingEquality() async throws {
-        let b1 = HotkeyBinding(keyCode: 0x04, modifiers: 123)
-        let b2 = HotkeyBinding(keyCode: 0x04, modifiers: 123)
-        let b3 = HotkeyBinding(keyCode: 0x05, modifiers: 123)
-
-        #expect(b1 == b2)
-        #expect(b1 != b3)
-    }
-
-    @Test func hotkeyActionRawValues() async throws {
-        #expect(HotkeyAction.toggleDashboard.rawValue == "toggleDashboard")
-        #expect(HotkeyAction.approveNext.rawValue == "approveNext")
-        #expect(HotkeyAction.rejectNext.rawValue == "rejectNext")
-    }
-
-    @Test func hotkeyActionAllCasesCount() async throws {
-        #expect(HotkeyAction.allCases.count == 3)
+    func setSoundName(_ name: String, for eventType: EventType) {
+        soundNames[eventType] = name
     }
 }
 
-@Suite("Hotkey Action Tests")
-struct HotkeyActionTests {
+// MARK: - Test Helpers
 
-    @Test @MainActor func approveNextRemovesFirstPendingApproval() async throws {
-        let appState = AppState()
-        let mockAPI = MockAPIClient()
-        let mockNotification = MockNotificationService()
-        appState.configure(notificationService: mockNotification, apiClient: mockAPI)
-
-        // Add test approvals
-        let approval = Approval(
-            id: "test-1",
-            issueId: "HCS-001",
-            phase: "review",
-            reason: "Test",
+func createTestEvent(
+    type: EventType,
+    issueId: String = "TEST-123",
+    outcome: VerdictOutcome = .pass
+) -> WebSocketEvent {
+    let payload: Data
+    switch type {
+    case .verdict, .escalation:
+        let verdict = VerdictEntry(
+            timestamp: Date(),
+            issueId: issueId,
+            gate: "review",
+            outcome: outcome,
+            reason: "Test reason",
             agent: "test-agent"
         )
-        appState.pendingApprovals = [approval]
+        let verdictPayload = VerdictPayload(verdict: verdict)
+        payload = (try? JSONEncoder().encode(verdictPayload)) ?? Data()
+    default:
+        payload = Data()
+    }
+    return WebSocketEvent(type: type, timestamp: Date(), payload: payload)
+}
 
-        await appState.approveNext()
+// MARK: - Event Severity Tests
 
-        #expect(appState.pendingApprovals.isEmpty)
+@Suite("Event Severity Tests")
+struct EventSeverityTests {
+    @Test func heartbeatSeverityIsInfo() async throws {
+        let event = createTestEvent(type: .heartbeat)
+        #expect(event.severity == .info)
     }
 
-    @Test @MainActor func rejectNextRemovesFirstPendingApproval() async throws {
-        let appState = AppState()
-        let mockAPI = MockAPIClient()
-        let mockNotification = MockNotificationService()
-        appState.configure(notificationService: mockNotification, apiClient: mockAPI)
-
-        let approval = Approval(
-            id: "test-2",
-            issueId: "HCS-002",
-            phase: "review",
-            reason: "Test",
-            agent: "test-agent"
-        )
-        appState.pendingApprovals = [approval]
-
-        await appState.rejectNext()
-
-        #expect(appState.pendingApprovals.isEmpty)
+    @Test func verdictPassSeverityIsInfo() async throws {
+        let event = createTestEvent(type: .verdict, outcome: .pass)
+        #expect(event.severity == .info)
     }
 
-    @Test @MainActor func approveNextWithEmptyQueueDoesNothing() async throws {
-        let appState = AppState()
-        let mockAPI = MockAPIClient()
-        let mockNotification = MockNotificationService()
-        appState.configure(notificationService: mockNotification, apiClient: mockAPI)
+    @Test func verdictFailSeverityIsWarning() async throws {
+        let event = createTestEvent(type: .verdict, outcome: .fail)
+        #expect(event.severity == .warning)
+    }
 
-        appState.pendingApprovals = []
+    @Test func verdictEscalateSeverityIsCritical() async throws {
+        let event = createTestEvent(type: .verdict, outcome: .escalate)
+        #expect(event.severity == .critical)
+    }
 
-        await appState.approveNext()
+    @Test func escalationSeverityIsCritical() async throws {
+        let event = createTestEvent(type: .escalation)
+        #expect(event.severity == .critical)
+    }
+}
 
-        #expect(appState.lastError == nil)
+// MARK: - Project Code Extraction Tests
+
+@Suite("Project Code Extraction Tests")
+struct ProjectCodeExtractionTests {
+    @Test func extractsProjectCodeFromVerdictEvent() async throws {
+        let event = createTestEvent(type: .verdict, issueId: "AASF-123")
+        #expect(event.projectCode == "AASF")
+    }
+
+    @Test func extractsProjectCodeFromEscalationEvent() async throws {
+        let event = createTestEvent(type: .escalation, issueId: "HCS-456")
+        #expect(event.projectCode == "HCS")
+    }
+
+    @Test func heartbeatHasNoProjectCode() async throws {
+        let event = createTestEvent(type: .heartbeat)
+        #expect(event.projectCode == nil)
+    }
+
+    @Test func factoryUpdateHasNoProjectCode() async throws {
+        let event = createTestEvent(type: .factoryUpdate)
+        #expect(event.projectCode == nil)
+    }
+}
+
+// MARK: - Event Filtering Tests
+
+@Suite("Event Filtering Tests")
+struct EventFilteringTests {
+    @Test @MainActor func filtersEventsByType() async throws {
+        let mockSound = MockSoundAlertService()
+        let viewModel = EventStreamViewModel(soundService: mockSound)
+
+        viewModel.addEvent(createTestEvent(type: .verdict))
+        viewModel.addEvent(createTestEvent(type: .heartbeat))
+        viewModel.addEvent(createTestEvent(type: .escalation))
+
+        var filterState = EventFilterState()
+        filterState.selectedEventTypes = [.verdict]
+
+        let filtered = viewModel.filteredEvents(with: filterState)
+        #expect(filtered.count == 1)
+        #expect(filtered.first?.type == .verdict)
+    }
+
+    @Test @MainActor func filtersEventsByProject() async throws {
+        let mockSound = MockSoundAlertService()
+        let viewModel = EventStreamViewModel(soundService: mockSound)
+
+        viewModel.addEvent(createTestEvent(type: .verdict, issueId: "AASF-100"))
+        viewModel.addEvent(createTestEvent(type: .verdict, issueId: "HCS-200"))
+        viewModel.addEvent(createTestEvent(type: .verdict, issueId: "AASF-300"))
+
+        var filterState = EventFilterState()
+        filterState.selectedProjectCode = "AASF"
+
+        let filtered = viewModel.filteredEvents(with: filterState)
+        #expect(filtered.count == 2)
+        #expect(filtered.allSatisfy { $0.projectCode == "AASF" })
+    }
+
+    @Test @MainActor func filtersEventsBySeverity() async throws {
+        let mockSound = MockSoundAlertService()
+        let viewModel = EventStreamViewModel(soundService: mockSound)
+
+        viewModel.addEvent(createTestEvent(type: .verdict, outcome: .pass))
+        viewModel.addEvent(createTestEvent(type: .verdict, outcome: .fail))
+        viewModel.addEvent(createTestEvent(type: .verdict, outcome: .escalate))
+
+        var filterState = EventFilterState()
+        filterState.selectedSeverities = [.critical]
+
+        let filtered = viewModel.filteredEvents(with: filterState)
+        #expect(filtered.count == 1)
+        #expect(filtered.first?.severity == .critical)
+    }
+
+    @Test @MainActor func combinesMultipleFilters() async throws {
+        let mockSound = MockSoundAlertService()
+        let viewModel = EventStreamViewModel(soundService: mockSound)
+
+        viewModel.addEvent(createTestEvent(type: .verdict, issueId: "AASF-100", outcome: .pass))
+        viewModel.addEvent(createTestEvent(type: .verdict, issueId: "AASF-200", outcome: .escalate))
+        viewModel.addEvent(createTestEvent(type: .verdict, issueId: "HCS-300", outcome: .escalate))
+        viewModel.addEvent(createTestEvent(type: .escalation, issueId: "AASF-400"))
+
+        var filterState = EventFilterState()
+        filterState.selectedProjectCode = "AASF"
+        filterState.selectedSeverities = [.critical]
+        filterState.selectedEventTypes = [.verdict]
+
+        let filtered = viewModel.filteredEvents(with: filterState)
+        #expect(filtered.count == 1)
+        #expect(filtered.first?.projectCode == "AASF")
+        #expect(filtered.first?.severity == .critical)
+        #expect(filtered.first?.type == .verdict)
+    }
+
+    @Test @MainActor func nilProjectFilterShowsAllProjects() async throws {
+        let mockSound = MockSoundAlertService()
+        let viewModel = EventStreamViewModel(soundService: mockSound)
+
+        viewModel.addEvent(createTestEvent(type: .verdict, issueId: "AASF-100"))
+        viewModel.addEvent(createTestEvent(type: .verdict, issueId: "HCS-200"))
+        viewModel.addEvent(createTestEvent(type: .verdict, issueId: "TEST-300"))
+
+        var filterState = EventFilterState()
+        filterState.selectedProjectCode = nil  // All projects
+
+        let filtered = viewModel.filteredEvents(with: filterState)
+        #expect(filtered.count == 3)
+    }
+}
+
+// MARK: - Sound Alert Tests
+
+@Suite("Sound Alert Tests")
+struct SoundAlertTests {
+    @Test func defaultSoundsConfigured() async throws {
+        let service = SoundAlertService()
+        #expect(service.soundName(for: .verdict) == "Glass")
+        #expect(service.soundName(for: .escalation) == "Sosumi")
+    }
+
+    @Test func escalationAndVerdictEnabledByDefault() async throws {
+        let testDefaults = UserDefaults(suiteName: "HCS007SoundTest")!
+        testDefaults.removePersistentDomain(forName: "HCS007SoundTest")
+
+        let service = SoundAlertService(defaults: testDefaults)
+        #expect(service.isSoundEnabled(for: .escalation) == true)
+        #expect(service.isSoundEnabled(for: .verdict) == true)
+        #expect(service.isSoundEnabled(for: .heartbeat) == false)
+
+        testDefaults.removePersistentDomain(forName: "HCS007SoundTest")
+    }
+
+    @Test func canDisableSoundForEventType() async throws {
+        let testDefaults = UserDefaults(suiteName: "HCS007SoundDisableTest")!
+        testDefaults.removePersistentDomain(forName: "HCS007SoundDisableTest")
+
+        let service = SoundAlertService(defaults: testDefaults)
+        service.setSoundEnabled(false, for: .verdict)
+        #expect(service.isSoundEnabled(for: .verdict) == false)
+
+        testDefaults.removePersistentDomain(forName: "HCS007SoundDisableTest")
+    }
+
+    @Test func canSetCustomSoundName() async throws {
+        let testDefaults = UserDefaults(suiteName: "HCS007CustomSoundTest")!
+        testDefaults.removePersistentDomain(forName: "HCS007CustomSoundTest")
+
+        let service = SoundAlertService(defaults: testDefaults)
+        service.setSoundName("Hero", for: .verdict)
+        #expect(service.soundName(for: .verdict) == "Hero")
+
+        testDefaults.removePersistentDomain(forName: "HCS007CustomSoundTest")
+    }
+
+    @Test @MainActor func viewModelPlaysSoundOnNewEvent() async throws {
+        let mockSound = MockSoundAlertService()
+        let viewModel = EventStreamViewModel(soundService: mockSound)
+
+        viewModel.addEvent(createTestEvent(type: .verdict))
+
+        #expect(mockSound.playedSounds.contains(.verdict))
+    }
+
+    @Test @MainActor func viewModelDoesNotPlayDisabledSound() async throws {
+        let mockSound = MockSoundAlertService()
+        mockSound.enabledTypes = []  // Disable all sounds
+        let viewModel = EventStreamViewModel(soundService: mockSound)
+
+        viewModel.addEvent(createTestEvent(type: .verdict))
+
+        #expect(mockSound.playedSounds.isEmpty)
+    }
+}
+
+// MARK: - Event Stream View Model Tests
+
+@Suite("Event Stream View Model Tests")
+struct EventStreamViewModelTests {
+    @Test @MainActor func addsEventsToStream() async throws {
+        let mockSound = MockSoundAlertService()
+        let viewModel = EventStreamViewModel(soundService: mockSound)
+
+        viewModel.addEvent(createTestEvent(type: .verdict))
+        viewModel.addEvent(createTestEvent(type: .escalation))
+
+        #expect(viewModel.events.count == 2)
+    }
+
+    @Test @MainActor func clearsAllEvents() async throws {
+        let mockSound = MockSoundAlertService()
+        let viewModel = EventStreamViewModel(soundService: mockSound)
+
+        viewModel.addEvent(createTestEvent(type: .verdict))
+        viewModel.addEvent(createTestEvent(type: .escalation))
+        viewModel.clearEvents()
+
+        #expect(viewModel.events.isEmpty)
+    }
+
+    @Test @MainActor func trimEventsWhenExceedingMax() async throws {
+        let mockSound = MockSoundAlertService()
+        let viewModel = EventStreamViewModel(soundService: mockSound, maxEvents: 5)
+
+        for _ in 0..<10 {
+            viewModel.addEvent(createTestEvent(type: .heartbeat))
+        }
+
+        #expect(viewModel.events.count == 5)
+    }
+
+    @Test @MainActor func extractsAvailableProjectsFromEvents() async throws {
+        let mockSound = MockSoundAlertService()
+        let viewModel = EventStreamViewModel(soundService: mockSound)
+
+        viewModel.addEvent(createTestEvent(type: .verdict, issueId: "AASF-100"))
+        viewModel.addEvent(createTestEvent(type: .verdict, issueId: "HCS-200"))
+        viewModel.addEvent(createTestEvent(type: .verdict, issueId: "AASF-300"))
+
+        #expect(viewModel.availableProjects.contains("AASF"))
+        #expect(viewModel.availableProjects.contains("HCS"))
+        #expect(viewModel.availableProjects.count == 2)
+    }
+}
+
+// MARK: - EventFilterState Tests
+
+@Suite("EventFilterState Tests")
+struct EventFilterStateTests {
+    @Test func defaultStateIncludesAllEventTypes() async throws {
+        let state = EventFilterState()
+        for eventType in EventType.allCases {
+            #expect(state.selectedEventTypes.contains(eventType))
+        }
+    }
+
+    @Test func defaultStateIncludesAllSeverities() async throws {
+        let state = EventFilterState()
+        for severity in EventSeverity.allCases {
+            #expect(state.selectedSeverities.contains(severity))
+        }
+    }
+
+    @Test func defaultProjectFilterIsNil() async throws {
+        let state = EventFilterState()
+        #expect(state.selectedProjectCode == nil)
     }
 }
 ```
@@ -645,12 +1150,14 @@ struct HotkeyActionTests {
 
 | Guard | Location | Recovery |
 |-------|----------|----------|
-| `checkAccessibility()` returns false | HotkeyService.registerHotkeys() | Skip registration; system prompts user for permission |
-| `apiClient` is nil | AppState.approveNext() / rejectNext() | Guard returns early, no action taken |
-| `pendingApprovals.first` is nil | AppState.approveNext() / rejectNext() | Guard returns early, no action taken |
-| `RegisterEventHotKey` returns error | HotkeyService.registerHotkey() | Skip that hotkey, continue registering others |
-| JSON decode fails | HotkeyPreferences.binding(for:) | Return default binding from `defaultBindings` |
-| `hotkeyService` is nil | HeimdallApp.wireHotkeys() | Guard returns early, no wiring |
+| `filterState.selectedEventTypes.contains(event.type)` | EventStreamViewModel.filteredEvents() | Event excluded from filtered results |
+| `filterState.selectedProjectCode` != nil | EventStreamViewModel.filteredEvents() | If nil, all projects shown; if set, only matching projects |
+| `filterState.selectedSeverities.contains(event.severity)` | EventStreamViewModel.filteredEvents() | Event excluded from filtered results |
+| `isSoundEnabled(for:)` returns false | SoundAlertService.playSound() | No sound played, method returns early |
+| `soundName.isEmpty` | SoundAlertService.playSound() | No sound played (silent for heartbeat) |
+| `events.count > maxEvents` | EventStreamViewModel.trimEventsIfNeeded() | Oldest events removed to maintain cap |
+| `!isPaused` | EventStreamView.scrollToLatestIfNotPaused() | No auto-scroll while user hovers |
+| `payload` decode fails | EventRow.eventSummary() | Fallback to simple type name string |
 
 ---
 
@@ -660,42 +1167,64 @@ struct HotkeyActionTests {
 |-------|----------------|----------|
 | Build succeeds | `swift build` | Exit 0, no errors |
 | Tests pass | `swift test` | All tests green |
-| Preferences persist | Run HotkeyPreferencesTests | Custom bindings stored/retrieved correctly |
-| Default bindings correct | Run HotkeyPreferencesTests | ⌃⌥⌘H/A/R verified with correct key codes |
-| Accessibility prompt | Launch app without permission | System accessibility dialog appears |
-| Toggle dashboard | Press ⌃⌥⌘H from any app | Dashboard window toggles visibility |
-| Approve next | Press ⌃⌥⌘A with pending item | First item approved, removed from queue |
-| Reject next | Press ⌃⌥⌘R with pending item | First item rejected, removed from queue |
+| Severity inference | Run EventSeverityTests | Pass/fail/escalate mapped correctly |
+| Project extraction | Run ProjectCodeExtractionTests | "AASF-123" → "AASF" |
+| Type filtering | Run EventFilteringTests | Only selected types shown |
+| **Project filtering** | Run EventFilteringTests.filtersEventsByProject | **Only AASF events when AASF selected** |
+| Severity filtering | Run EventFilteringTests | Only selected severities shown |
+| Combined filtering | Run EventFilteringTests.combinesMultipleFilters | All filters applied together |
+| Sound defaults | Run SoundAlertTests | Escalation/verdict enabled by default |
+| Sound config | Run SoundAlertTests | Enable/disable persists to UserDefaults |
+| Event trimming | Run EventStreamViewModelTests | Max events enforced |
 
 ---
 
 ## Test Strategy
 
 ### Test Files
-- `Tests/HEIMDALLControlSurfaceTests/HotkeyTests.swift` (CREATE)
+- `Tests/HEIMDALLControlSurfaceTests/EventStreamTests.swift` (CREATE)
 
-### Test Cases
+### Test Suites and Cases
 
 | Suite | Test | Verification |
 |-------|------|--------------|
-| HotkeyPreferencesTests | defaultBindingsExistForAllActions | All actions have non-zero modifiers |
-| HotkeyPreferencesTests | defaultToggleDashboardIsControlOptionCommandH | keyCode=0x04, mods=⌃⌥⌘ |
-| HotkeyPreferencesTests | defaultApproveNextIsControlOptionCommandA | keyCode=0x00, mods=⌃⌥⌘ |
-| HotkeyPreferencesTests | defaultRejectNextIsControlOptionCommandR | keyCode=0x0F, mods=⌃⌥⌘ |
-| HotkeyPreferencesTests | customBindingPersistsToUserDefaults | Custom binding saved and retrieved |
-| HotkeyPreferencesTests | resetToDefaultRemovesCustomBinding | Reset restores default binding |
-| HotkeyPreferencesTests | hotkeyBindingEquality | Equatable implementation correct |
-| HotkeyPreferencesTests | hotkeyActionRawValues | Raw values match expected strings |
-| HotkeyPreferencesTests | hotkeyActionAllCasesCount | Exactly 3 actions |
-| HotkeyActionTests | approveNextRemovesFirstPendingApproval | First approval removed after action |
-| HotkeyActionTests | rejectNextRemovesFirstPendingApproval | First approval removed after action |
-| HotkeyActionTests | approveNextWithEmptyQueueDoesNothing | No error when queue empty |
+| EventSeverityTests | heartbeatSeverityIsInfo | Heartbeat → info |
+| EventSeverityTests | verdictPassSeverityIsInfo | Pass → info |
+| EventSeverityTests | verdictFailSeverityIsWarning | Fail → warning |
+| EventSeverityTests | verdictEscalateSeverityIsCritical | Escalate → critical |
+| EventSeverityTests | escalationSeverityIsCritical | Escalation → critical |
+| ProjectCodeExtractionTests | extractsProjectCodeFromVerdictEvent | AASF-123 → AASF |
+| ProjectCodeExtractionTests | extractsProjectCodeFromEscalationEvent | HCS-456 → HCS |
+| ProjectCodeExtractionTests | heartbeatHasNoProjectCode | Returns nil |
+| ProjectCodeExtractionTests | factoryUpdateHasNoProjectCode | Returns nil |
+| EventFilteringTests | filtersEventsByType | Only selected types |
+| EventFilteringTests | **filtersEventsByProject** | **Only AASF when AASF selected** |
+| EventFilteringTests | filtersEventsBySeverity | Only selected severities |
+| EventFilteringTests | combinesMultipleFilters | All filters applied |
+| EventFilteringTests | nilProjectFilterShowsAllProjects | All projects when nil |
+| SoundAlertTests | defaultSoundsConfigured | Glass, Sosumi configured |
+| SoundAlertTests | escalationAndVerdictEnabledByDefault | Both enabled |
+| SoundAlertTests | canDisableSoundForEventType | Persists to defaults |
+| SoundAlertTests | canSetCustomSoundName | Persists to defaults |
+| SoundAlertTests | viewModelPlaysSoundOnNewEvent | Sound triggered |
+| SoundAlertTests | viewModelDoesNotPlayDisabledSound | No sound if disabled |
+| EventStreamViewModelTests | addsEventsToStream | Events appended |
+| EventStreamViewModelTests | clearsAllEvents | Empty after clear |
+| EventStreamViewModelTests | trimEventsWhenExceedingMax | Capped at max |
+| EventStreamViewModelTests | extractsAvailableProjectsFromEvents | Projects extracted |
+| EventFilterStateTests | defaultStateIncludesAllEventTypes | All types selected |
+| EventFilterStateTests | defaultStateIncludesAllSeverities | All severities selected |
+| EventFilterStateTests | defaultProjectFilterIsNil | Nil = all projects |
 
 ### Verification Commands
 ```bash
 swift build
-swift test --filter HotkeyPreferencesTests
-swift test --filter HotkeyActionTests
+swift test --filter EventSeverityTests
+swift test --filter ProjectCodeExtractionTests
+swift test --filter EventFilteringTests
+swift test --filter SoundAlertTests
+swift test --filter EventStreamViewModelTests
+swift test --filter EventFilterStateTests
 swift test  # All tests
 ```
 
@@ -705,43 +1234,55 @@ swift test  # All tests
 
 ```json
 {
-  "issue_ref": "HCS-008",
+  "issue_ref": "HCS-007",
   "deliverables": [
     {
-      "file": "Sources/HEIMDALLControlSurface/Services/HotkeyPreferences.swift",
-      "function": "",
-      "change_description": "CREATE new file with HotkeyAction enum, HotkeyBinding struct, HotkeyPreferences class for UserDefaults storage with default bindings for Control+Option+Command+H/A/R",
-      "verification": "swift build succeeds; HotkeyPreferencesTests pass"
+      "file": "Sources/HEIMDALLControlSurface/Models/Event.swift",
+      "function": "EventSeverity enum, WebSocketEvent.severity, WebSocketEvent.projectCode",
+      "change_description": "MODIFY to add EventSeverity enum with info/warning/error/critical cases, add computed severity property based on event type and payload, add computed projectCode property to extract project prefix from issue IDs",
+      "verification": "swift build succeeds; EventSeverityTests and ProjectCodeExtractionTests pass"
     },
     {
-      "file": "Sources/HEIMDALLControlSurface/Services/HotkeyService.swift",
+      "file": "Sources/HEIMDALLControlSurface/Services/SoundAlertService.swift",
       "function": "",
-      "change_description": "CREATE new file with HotkeyServiceProtocol, HotkeyService class using Carbon RegisterEventHotKey API for global hotkey registration with accessibility check",
-      "verification": "swift build succeeds; hotkeys register when accessibility permission granted"
+      "change_description": "CREATE new file with SoundAlertServiceProtocol and SoundAlertService class providing per-event-type sound configuration using NSSound and UserDefaults persistence",
+      "verification": "swift build succeeds; SoundAlertTests pass"
     },
     {
-      "file": "Sources/HEIMDALLControlSurface/AppDelegate.swift",
-      "function": "applicationDidFinishLaunching, applicationWillTerminate",
-      "change_description": "MODIFY to remove inline hotkey code (setupGlobalHotkey, cleanupHotkey, hotkeyHandler, fourCharCode), add hotkeyService property, initialize HotkeyService on launch, cleanup on terminate",
-      "verification": "swift build succeeds; app launches with HotkeyService initialized"
+      "file": "Sources/HEIMDALLControlSurface/Views/EventFilterBar.swift",
+      "function": "",
+      "change_description": "CREATE new file with EventFilterState struct and EventFilterBar view providing filter controls for event type (multi-select menu), project (picker dropdown), and severity (multi-select menu)",
+      "verification": "swift build succeeds; view renders filter controls"
+    },
+    {
+      "file": "Sources/HEIMDALLControlSurface/Views/EventRow.swift",
+      "function": "",
+      "change_description": "CREATE new file with EventRow view displaying formatted event with severity icon, timestamp, type badge, project code, and summary text",
+      "verification": "swift build succeeds; view renders event rows"
+    },
+    {
+      "file": "Sources/HEIMDALLControlSurface/Views/EventStreamView.swift",
+      "function": "",
+      "change_description": "CREATE new file with EventStreamView providing scrolling list of filtered events with auto-scroll, pause-on-hover, connection status, and clear button",
+      "verification": "swift build succeeds; view renders event stream with auto-scroll"
+    },
+    {
+      "file": "Sources/HEIMDALLControlSurface/ViewModels/EventStreamViewModel.swift",
+      "function": "",
+      "change_description": "CREATE new file with EventStreamViewModel providing observable events array, filteredEvents(with:) method implementing type/project/severity filtering, addEvent() with sound playback, and project extraction",
+      "verification": "swift build succeeds; EventFilteringTests and EventStreamViewModelTests pass"
     },
     {
       "file": "Sources/HEIMDALLControlSurface/AppState.swift",
-      "function": "approveNext, rejectNext",
-      "change_description": "ADD two new async methods to approve/reject first pending item in queue via apiClient",
-      "verification": "swift build succeeds; HotkeyActionTests pass"
+      "function": "eventStreamViewModel property, handleEvent modification",
+      "change_description": "MODIFY to add eventStreamViewModel property and forward all WebSocket events to it in handleEvent(_:)",
+      "verification": "swift build succeeds; events flow to view model"
     },
     {
-      "file": "Sources/HEIMDALLControlSurface/HeimdallApp.swift",
-      "function": "wireHotkeys",
-      "change_description": "ADD wireHotkeys() method to set handlers for toggleDashboard/approveNext/rejectNext actions and call registerHotkeys(); call from onAppear",
-      "verification": "swift build succeeds; hotkey handlers connected to AppState methods"
-    },
-    {
-      "file": "Tests/HEIMDALLControlSurfaceTests/HotkeyTests.swift",
+      "file": "Tests/HEIMDALLControlSurfaceTests/EventStreamTests.swift",
       "function": "",
-      "change_description": "CREATE new test file with HotkeyPreferencesTests suite (9 tests) and HotkeyActionTests suite (3 tests) testing persistence, defaults, reset, and action execution",
-      "verification": "swift test passes all HotkeyPreferencesTests and HotkeyActionTests"
+      "change_description": "CREATE new test file with EventSeverityTests (5 tests), ProjectCodeExtractionTests (4 tests), EventFilteringTests (6 tests including project filtering), SoundAlertTests (6 tests), EventStreamViewModelTests (4 tests), EventFilterStateTests (3 tests)",
+      "verification": "swift test passes all EventStreamTests"
     }
   ]
 }
